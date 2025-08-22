@@ -1,0 +1,22 @@
+{
+  "name": "event-server",
+  "version": "1.0.0",
+  "description": "통신, 로그 저장 및 조회, (관리자) 로그인",
+  "keywords": [],
+  "author": "",
+  "scripts": {
+    "dev": "nodemon app.js"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.0.1",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3"
+  }
+}
