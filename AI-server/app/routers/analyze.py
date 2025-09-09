@@ -1,7 +1,7 @@
 # CCTV 프레임이나 DetectionBatch를 입력받아 분석하고 Event-server로 전송
 from fastapi import APIRouter, UploadFile, File, HTTPException
 import numpy as np, cv2, logging
-from app.services.inference import run_inference_on_image
+from app.models.inference import run_inference_on_image
 from app.clients.event_client import post_detections
 
 router = APIRouter(prefix="/analyze", tags=["analyze"])
