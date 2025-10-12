@@ -14,12 +14,12 @@ class Face(BaseModel):
 
 class OneDet(BaseModel):
     track_id: int
-    bbox: conlist(float, min_items=4, max_items=4)
+    bbox: conlist(float, min_length=4, max_length=4)
     cls: str
     score: float
     reid: Optional[ReID] = None
     face: Optional[Face] = None
-    center: Optional[conlist(float, min_items=2, max_items=2)] = None
+    center: Optional[conlist(float, min_length=2, max_length=2)] = None
 
 class DetectionBatch(BaseModel):
     camera_id: str

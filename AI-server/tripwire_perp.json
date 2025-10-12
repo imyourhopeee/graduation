@@ -1,0 +1,21 @@
+[
+  {
+    "p1": [
+      920,
+      446
+    ],
+    "p2": [
+      911,
+      585
+    ],
+    "b_near": 20.0,
+    "b_far": 8.0,
+    "inward_sign": 1,
+    "d_near": 395.0,
+    "d_far": 315.0,
+    "seat_id": 0,
+    "ref_w": null,
+    "ref_h": null,
+    "flip_horizontal": null
+  }
+]

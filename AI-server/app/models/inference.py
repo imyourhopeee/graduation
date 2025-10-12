@@ -1,19 +1,37 @@
-# 필요한 기능들을 불러오는 통합된 코드
-
+# app/models/inference.py
 from __future__ import annotations
-import os, time, uuid, threading, json
+import os, time, uuid, threading, json, cv2, httpx
+import numpy as np
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
-from app.models.photo import PhoneBackDetector
-from app.models.face_rec import FaceRecognizer
-from app.models.face_rec_adapter import FaceRecognizer
-import cv2
-import numpy as np
 
-# 블러 모듈 (네 블러 로직 그대로 들어있는 Visualizer/BlurEngine)
+from app.models.intrusion_tripwire import TripwireApp, SeatWire
 from app.models.blur import BlurEngine
+from deep_sort.face_rec import recognize_identity
 
-# ====== YOLO 로더 (person 검출 용) ======
+# ---- (1) PhoneBackDetector 로딩 안전화 ----
+class _DummyPhoneDetector:
+    def scan(self, timeout_sec: float) -> bool:
+        return False
+
+def _load_phone_detector():
+    try:
+        from app.models.photo_adapter import PhoneBackDetector as _Real
+        print("[PHONE] ✅ using real PhoneBackDetector")
+        return _Real()
+    except Exception as e:
+        print("[PHONE] ⚠️ fallback to dummy:", repr(e))
+        return _DummyPhoneDetector()
+
+# ---- (2) 상수 ----
+EXIT_SECONDS  = float(os.getenv("EXIT_SECONDS", "1.5"))
+DWELL_SECONDS = 8.0
+SEATS_JSON_PATH = os.getenv("SEATS_CONFIG", "tripwire_perp.json")
+DWELL_JSON_PATH = os.getenv("DWELL_CONFIG", "dwell.json")
+EVENT_BASE = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
+EVENT_PATH = os.getenv("EVENT_EVENTS_PATH", "/events")
+
 try:
     from ultralytics import YOLO
     _YOLO_OK = True
@@ -21,118 +39,18 @@ except Exception:
     YOLO = None
     _YOLO_OK = False
 
-# ====== 침입 트립와이어: 네 코드와 동일한 규칙/구조 ======
-DWELL_SECONDS = float(os.getenv("DWELL_SECONDS", "8.0"))
-EXIT_SECONDS  = float(os.getenv("EXIT_SECONDS", "1.5"))
 
-def feet_point_xyxy(x1, y1, x2, y2) -> Tuple[int, int]:
-    return int((x1 + x2) / 2), int(y2)
-
-@dataclass
-class SeatWire:
-    p1: Tuple[int,int]
-    p2: Tuple[int,int]
-    b_near: float = 20.0
-    b_far:  float = 8.0
-    inward_sign: int = +1
-    d_near: float = 180.0
-    d_far:  float = 120.0
-    # 상태/타이머
-    state: str = "OUTSIDE"
-    dwell_s: float = 0.0
-    exit_s: float = 0.0
-    seat_id: int = 0
-
-    def y_near_far(self):
-        y1, y2 = self.p1[1], self.p2[1]
-        return (max(y1, y2), min(y1, y2))
-
-    def depth_at_y(self, fy: int) -> float:
-        y_near, y_far = self.y_near_far()
-        if y_near == y_far:
-            return self.d_near
-        fyc = int(np.clip(fy, y_far, y_near))
-        t = (fyc - y_far) / max(1, (y_near - y_far))
-        return self.d_far * (1 - t) + self.d_near * t
-
-    def band_at_y(self, fy: int) -> float:
-        y_near, y_far = self.y_near_far()
-        if y_near == y_far:
-            return self.b_near
-        fyc = int(np.clip(fy, y_far, y_near))
-        t = (fyc - y_far) / max(1, (y_near - y_far))
-        return self.b_far * (1 - t) + self.b_near * t
-
-    def intruded(self, feet: Tuple[int, int]) -> bool:
-        fx, fy = feet
-        a = np.array(self.p1, np.float32); b = np.array(self.p2, np.float32)
-        v = b - a
-        if np.linalg.norm(v) < 1e-3:
-            return False
-
-        n = np.array([-v[1], v[0]], np.float32)
-        n /= (np.linalg.norm(n) + 1e-6)
-
-        p = np.array([fx, fy], np.float32)
-        w = p - a
-        len_v = np.linalg.norm(v)
-        u = float(np.dot(w, v) / (len_v + 1e-6))
-        s = float(np.dot(w, n)) * self.inward_sign
-
-        in_span = (-10.0 <= u <= (len_v + 10.0))
-        # 네 최신 코드 기준: margin 없이 s>0.0 만 사용
-        max_depth = self.depth_at_y(fy)
-        inside_strip = (s > 0.0) and (s <= max_depth)
-        return in_span and inside_strip
-
-def update_seat_fsm(seat: SeatWire, any_in_core: bool, dt: float,
-                    dwellSeconds=DWELL_SECONDS, exitSeconds=EXIT_SECONDS):
-    if seat.state == "OUTSIDE":
-        seat.dwell_s = 0.0; seat.exit_s = 0.0
-        if any_in_core:
-            seat.state = "ENTERING"
-
-    elif seat.state == "ENTERING":
-        if any_in_core:
-            seat.dwell_s += dt
-            if seat.dwell_s >= dwellSeconds:
-                seat.state = "INTRUDED"
-                seat.exit_s = 0.0
-        else:
-            seat.exit_s += dt
-            if seat.exit_s >= 0.5:
-                seat.state = "OUTSIDE"
-
-    elif seat.state == "INTRUDED":
-        if not any_in_core:
-            seat.exit_s += dt
-            if seat.exit_s >= exitSeconds:
-                seat.state = "OUTSIDE"
-                seat.dwell_s = 0.0
-        else:
-            seat.exit_s = 0.0
-
-class EMA:
-    def __init__(self, alpha=0.25):
-        self.alpha = alpha
-        self.val = None
-    def update(self, p):
-        v = np.array(p, np.float32)
-        if self.val is None: self.val = v
-        else: self.val = self.alpha*v + (1-self.alpha)*self.val
-        return tuple(map(int, self.val))
-
-# ====== 결과 스키마 ======
+# ---- (3) 결과 구조체 ----
 @dataclass
 class Detection:
-    bbox: Tuple[int,int,int,int]
+    bbox: Tuple[int, int, int, int]
     cls: Optional[int] = None
     score: Optional[float] = None
 
 @dataclass
 class InferenceResult:
     frame: np.ndarray
-    detections: List[Detection] = field(default_factory=list)    # person 박스만 포함
+    detections: List[Detection] = field(default_factory=list)
     intrusion_started: bool = False
     intrusion_active: bool = False
     seat_id: Optional[int] = None
@@ -141,221 +59,293 @@ class InferenceResult:
     phone_capture: Optional[bool] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
-# ====== 좌석 FSM 엔진 (다좌석 지원) ======
-class SeatIntrusionEngine:
-    def __init__(self,
-                 seats: Optional[List[SeatWire]] = None,
-                 dwell_sec: float = DWELL_SECONDS,
-                 exit_sec: float = EXIT_SECONDS,
-                 ema_alpha: float = 0.25):
-        self.seats = seats or [SeatWire((200,400),(440,400), inward_sign=+1, seat_id=0)]
-        self.dwell_sec = dwell_sec
-        self.exit_sec = exit_sec
-        self.ema = EMA(alpha=ema_alpha)
 
-    @staticmethod
-    def _feet_from_bbox(b: Tuple[int,int,int,int]) -> Tuple[int,int]:
-        return feet_point_xyxy(*b)
-
-    def update(self, person_bboxes: List[Tuple[int,int,int,int]], dt: float):
-        started = False
-        active = False
-        intruded_seat = None
-
-        feet_points = [ self.ema.update(self._feet_from_bbox(b)) for b in person_bboxes ]
-
-        for s in self.seats:
-            any_core = any(s.intruded(fp) for fp in feet_points)
-            prev = s.state
-            update_seat_fsm(s, any_core, dt, dwellSeconds=self.dwell_sec, exitSeconds=self.exit_sec)
-
-            if prev != "INTRUDED" and s.state == "INTRUDED":
-                started = True
-                intruded_seat = s.seat_id
-
-            if s.state == "INTRUDED":
-                active = True
-                if intruded_seat is None:
-                    intruded_seat = s.seat_id
-
-        return started, active, intruded_seat
-
-# ====== 오케스트레이터 ======
+# ---- (4) 엔진 클래스 ----
 class InferenceEngine:
     def __init__(self,
-                 blur_model: Optional[str] = None,
-                 blur_conf: float = 0.5,
-                 person_model: Optional[str] = None,
-                 person_conf: float = 0.4,
-                 seats_config: Optional[str] = None,
-                 face_cam_source: str = "0",
-                 on_event=None):
-        
-        self._lock = getattr(self, "_lock", threading.Lock())
-        # 1) 블러 엔진 (blur.py)
-        self.blur = BlurEngine(model_path=blur_model or os.getenv("BLUR_MODEL", "runs/detect/train11/weights/best.pt"),
-                               conf=float(os.getenv("BLUR_CONF", blur_conf)))
+                 blur_model=None, blur_conf=0.5,
+                 person_model=None, person_conf=0.4,
+                 face_cam_source="0"):
+        self._lock = threading.Lock()
+        self.blur = BlurEngine(weights=blur_model or os.getenv("BLUR_MODEL", "../runs/detect/train11/weights/best.pt"),
+                               conf_thr=float(os.getenv("BLUR_CONF", blur_conf)))
 
-        # 2) 사람 검출 모델 (COCO person=0)
-        self.person_model = None
-        if _YOLO_OK:
-            try:
-                pm = person_model or os.getenv("PERSON_MODEL", "yolov8n.pt")
-                self.person_model = YOLO(pm)
-            except Exception:
-                self.person_model = None
+        # 사람 감지용 YOLO
+        self.person_model = YOLO(person_model or os.getenv("PERSON_MODEL", "yolov8n.pt")) if _YOLO_OK else None
         self.person_conf = float(os.getenv("PERSON_CONF", person_conf))
 
-        # 3) 좌석 구성 로드 (intrusion_tripwire.py)
-        seats = self._load_seats(seats_config or os.getenv("SEATS_CONFIG", "tripwire_perp.json"))
-        self.seat_engine = SeatIntrusionEngine(seats=seats,
-                                               dwell_sec=DWELL_SECONDS,
-                                               exit_sec=EXIT_SECONDS,
-                                               ema_alpha=float(os.getenv("EMA_ALPHA","0.25")))
+        # 침입 감지 엔진
+        self.tripwire_app = self._load_from_files()
 
-        # 4) 스마트폰 후면 촬영 감지 (photo.py)
-        self.phone = PhoneBackDetector(
-            weights=os.getenv("PHONE_MODEL", "runs/detect/train12/weights/best.pt"),
-            cam_source=os.getenv("CAM1_SOURCE", face_cam_source),
-            conf=float(os.getenv("PHONE_CONF", "0.8")),
-            dwell=float(os.getenv("PHONE_DWELL", "1.5")),
-            hold=float(os.getenv("PHONE_HOLD", "2.0")),
-            imgsz=int(os.getenv("PHONE_IMGSZ", "640")),
-        )
-        self._last_phone_capture: bool | None = None
-        self._phone_busy: bool = False  # 중복 트리거 방지 플래그
+        # 스마트폰 감지기 (실제 or 더미)
+        self.phone = _load_phone_detector()
 
-        # 타이밍
+        # 상태 변수
+        self._last_phone_capture = None
+        self._phone_busy = False
         self._last_ts = time.time()
-        self._corr_id: Optional[str] = None
-        self._last_identity: Optional[Tuple[str,float]] = None
+        self._corr_id = None
+        self._last_identity = None
 
-    def _load_seats(self, path: Optional[str]) -> List[SeatWire]:
-        if not path:
-            return [SeatWire((200,400),(440,400), inward_sign=+1, seat_id=0)]
-        try:
-            if not os.path.exists(path):
-                return [SeatWire((200,400),(440,400), inward_sign=+1, seat_id=0)]
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            seats: List[SeatWire] = []
-            for i, d in enumerate(data, start=0):
-                seats.append(SeatWire(
-                    p1=tuple(d["p1"]),
-                    p2=tuple(d["p2"]),
-                    b_near=float(d.get("b_near", 20.0)),
-                    b_far=float(d.get("b_far", 8.0)),
-                    inward_sign=int(d.get("inward_sign", 1)),
-                    d_near=float(d.get("d_near", 180.0)),
-                    d_far=float(d.get("d_far", 120.0)),
-                    seat_id=int(d.get("seat_id", i)),
-                ))
-            return seats or [SeatWire((200,400),(440,400), inward_sign=+1, seat_id=0)]
-        except Exception:
-            return [SeatWire((200,400),(440,400), inward_sign=+1, seat_id=0)]
+    # def _load_from_files(self) -> TripwireApp:
+    #     # 좌석 정보 로드
+    #     seats = []
+    #     if Path(SEATS_JSON_PATH).exists():
+    #         try:
+    #             data = json.loads(Path(SEATS_JSON_PATH).read_text(encoding="utf-8"))
+    #             seats = [SeatWire(**d) for d in data]
+    #         except Exception as e:
+    #             print("[LOAD SEATS FAIL]", e)
 
-    # ---- 사람 검출 (person only) ----
+    #     # dwell 시간 로드
+    #     dwell_sec = DWELL_SECONDS
+    #     if Path(DWELL_JSON_PATH).exists():
+    #         try:
+    #             data = json.loads(Path(DWELL_JSON_PATH).read_text(encoding="utf-8"))
+    #             dwell_sec = float(data.get("seconds", DWELL_SECONDS))
+    #         except Exception as e:
+    #             print("[LOAD DWELL FAIL]", e)
+
+    #     return TripwireApp(cam=None, seats=seats, dwell_sec=dwell_sec, on_intrusion=self._post_intrusion_event)
+
+    def _load_from_files(self) -> TripwireApp:
+    # 좌석 정보 로드 (NULL/옛 키 정리)
+        seats = []
+        p_seats = Path(SEATS_JSON_PATH)
+        if p_seats.exists():
+            try:
+                raw = json.loads(p_seats.read_text(encoding="utf-8"))
+                if not isinstance(raw, list):
+                    raw = []
+                cleaned = []
+                for d in raw:
+                    if not isinstance(d, dict):
+                        continue
+                    # 구버전 키 제거
+                    for k in ("ref_w", "ref_h", "ref_aspect"):
+                        d.pop(k, None)
+
+                    # 좌표 필수
+                    p1 = d.get("p1"); p2 = d.get("p2")
+                    if not (isinstance(p1, (list, tuple)) and isinstance(p2, (list, tuple)) and len(p1) == 2 and len(p2) == 2):
+                        continue
+
+                    # None → 기본값 치환
+                    def f_or(v, default):
+                        try:
+                            return float(v) if v is not None else float(default)
+                        except Exception:
+                            return float(default)
+
+                    def i_or(v, default):
+                        try:
+                            return int(v) if v is not None else int(default)
+                        except Exception:
+                            return int(default)
+
+                    item = {
+                        "p1": (int(float(p1[0])), int(float(p1[1]))),
+                        "p2": (int(float(p2[0])), int(float(p2[1]))),
+                        "d_near": f_or(d.get("d_near"), 180.0),
+                        "d_far":  f_or(d.get("d_far"), 120.0),
+                        "inward_sign": 1 if i_or(d.get("inward_sign"), 1) >= 0 else -1,
+                        "seat_id": i_or(d.get("seat_id"), len(cleaned)),  # 없으면 인덱스 부여
+                        # 옵션 필드는 있으면 그대로
+                        "b_near": f_or(d.get("b_near"), 20.0),
+                        "b_far":  f_or(d.get("b_far"), 8.0),
+                    }
+
+                    # Tripwire에 넘길 SeatWire로 변환(정의에 없는 키는 무시)
+                    cleaned.append(SeatWire(
+                        p1=item["p1"], p2=item["p2"],
+                        b_near=item["b_near"], b_far=item["b_far"],
+                        inward_sign=item["inward_sign"],
+                        d_near=item["d_near"], d_far=item["d_far"],
+                        # SeatWire에 seat_id 필드가 없으면 저장은 meta로:
+                        # state/dwell_s/exit_s는 런타임에서 갱신
+                    ))
+                seats = cleaned
+            except Exception as e:
+                print("[LOAD SEATS FAIL]", e)
+
+        # dwell 시간 로드
+        dwell_sec = DWELL_SECONDS
+        p_dwell = Path(DWELL_JSON_PATH)
+        if p_dwell.exists():
+            try:
+                data = json.loads(p_dwell.read_text(encoding="utf-8"))
+                dwell_sec = float(data.get("seconds", DWELL_SECONDS))
+            except Exception as e:
+                print("[LOAD DWELL FAIL]", e)
+
+        return TripwireApp(cam=None, seats=seats, dwell_sec=dwell_sec, on_intrusion=self._post_intrusion_event)
+
+
+
+
+    # --- API용 getter/setter ---
+    def get_seats(self): return self.tripwire_app.seats
+    def set_seats(self, seats): self.tripwire_app.set_config(seats=seats)
+    def get_dwell_time(self): return self.tripwire_app.dwell_sec
+    def set_dwell_time(self, dwell_sec): self.tripwire_app.set_config(dwell_sec=dwell_sec)
+
+    # --- YOLO 사람 탐지 ---
     def _detect_persons(self, frame: np.ndarray) -> List[Detection]:
-        dets: List[Detection] = []
-        if self.person_model is None:
-            return dets
+        dets = []
+        if self.person_model is None: return dets
         r = self.person_model.predict(frame, verbose=False, conf=self.person_conf, classes=[0])[0]
-        if r and r.boxes is not None:
-            h, w = frame.shape[:2]
-            for b in r.boxes:
-                x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                # 프레임 경계로 클램프
-                x1 = int(np.clip(x1, 0, w-1)); x2 = int(np.clip(x2, 0, w-1))
-                y1 = int(np.clip(y1, 0, h-1)); y2 = int(np.clip(y2, 0, h-1))
-                if x2 > x1 and y2 > y1:
-                    dets.append(Detection(bbox=(x1,y1,x2,y2), cls=0, score=float(b.conf[0])))
+        if not r or r.boxes is None: return dets
+        h, w = frame.shape[:2]
+        for b in r.boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            x1, x2 = np.clip([x1, x2], 0, w-1)
+            y1, y2 = np.clip([y1, y2], 0, h-1)
+            if x2 > x1 and y2 > y1:
+                dets.append(Detection(bbox=(x1, y1, x2, y2), cls=0, score=float(b.conf)))
         return dets
-    
-    # 침입 전이 시, 모니터 웹캠으로 스마트폰 후면 촬영 감지를 비동기 수행
+
+    # --- 얼굴 + 폰 스캔 백그라운드 ---
+    # def _kick_phone_thread(self, corr_id, seat_id):
+    #     if self._phone_busy:
+    #         return
+    #     self._phone_busy = True
+
+    #     def _run():
+    #         try:
+    #             face_timeout = float(os.getenv("FACE_TIMEOUT", "3.0"))
+    #             cam1 = os.getenv("CAM1_SOURCE", "1")
+    #             label, conf = recognize_identity(timeout_sec=face_timeout, cam_source=cam1)
+    #             with self._lock:
+    #                 self._last_identity = (label, conf) if label else None
+
+    #             phone_timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "2.0"))
+    #             ok = self.phone.scan(timeout_sec=phone_timeout)
+    #             with self._lock:
+    #                 self._last_phone_capture = bool(ok)
+    #         except Exception as e:
+    #             print("[PHONE THREAD ERR]", e)
+    #         finally:
+    #             with self._lock:
+    #                 self._phone_busy = False
+
+    #     threading.Thread(target=_run, daemon=True).start()
     def _kick_phone_thread(self, corr_id: str, seat_id: int | None):
         if self._phone_busy:
-            return  # 이미 동작 중이면 중복 실행 방지
+            return
         self._phone_busy = True
 
         def _run():
             try:
-                timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "3.0"))
-                ok = self.phone.scan(timeout_sec=timeout)  # True/False
+                # 1) 얼굴 인식
+                face_timeout = float(os.getenv("FACE_TIMEOUT", "3.0"))
+                cam1 = os.getenv("CAM1_SOURCE", "1")
+
+                label = conf = None
+                try:
+                    face_res = recognize_identity(timeout_sec=face_timeout, cam_source=cam1)
+                    if isinstance(face_res, tuple) and len(face_res) >= 2:
+                        label, conf = face_res[0], face_res[1]
+                    elif isinstance(face_res, str):
+                        label = face_res
+                    # else: None 또는 형식 불일치 -> 그대로 None 유지
+                except Exception as fe:
+                    print("[FACE RECOG ERR]", fe)
+
                 with self._lock:
-                    self._last_phone_capture = bool(ok)
+                    self._last_identity = (label, conf) if label else None
+
+                # 2) 휴대폰 후면 감지(옵션)
+                timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "3.0"))
+                ok = False
+                try:
+                    ok = bool(self.phone.scan(timeout_sec=timeout))  # False/True/None 방어
+                except Exception as pe:
+                    print("[PHONE SCAN ERR]", pe)
+                with self._lock:
+                    self._last_phone_capture = ok
+
+            except Exception as e:
+                print("[PHONE THREAD ERR]", e)
             finally:
                 with self._lock:
                     self._phone_busy = False
 
-            # (선택) 이벤트 서버로 알림 보내고 싶으면 on_event 사용
-            if self.on_event:
-                self.on_event({
-                    "type": "phone_capture",
-                    "correlation_id": corr_id,
-                    "seat_id": seat_id,
-                    "detected": bool(self._last_phone_capture),
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                })
-
         threading.Thread(target=_run, daemon=True).start()
 
 
-    def process_frame(self, frame: np.ndarray, camera_id: str = "cam2",
-                      do_blur: bool = True, do_intrusion: bool = True) -> InferenceResult:
+    # --- 이벤트 전송 ---
+    def _post_intrusion_event(self, seat_id, timestamp, snapshot):
+        try:
+            with self._lock:
+                ident = self._last_identity
+            user_label = ident[0] if ident else None
+            user_conf  = ident[1] if ident else None
+            ts = timestamp or time.time()
+            payload = {
+                "type": "intrusion",
+                "device_id": "cam0",
+                "zone_id": int(seat_id) if seat_id is not None else None,
+                "user_label": user_label,
+                "identity_conf": user_conf,
+                "started_at": ts - self.tripwire_app.dwell_sec,
+                "ended_at": ts,
+                "meta": {"dwell_sec": self.tripwire_app.dwell_sec}
+            }
+            url = f"{EVENT_BASE.rstrip('/')}/{EVENT_PATH.lstrip('/')}"
+            ai_key = os.getenv("AI_SHARED_KEY")
+            headers = {"X-AI-Key": ai_key} if ai_key else {}
+            with httpx.Client(timeout=5.0, headers=headers) as c:
+                r = c.post(url, json=payload)
+            r.raise_for_status()
+        except Exception as e:
+            print("[EVENT POST FAIL]", e)
+
+    # --- 메인 추론 ---
+    def process_frame(self, frame: np.ndarray, camera_id="cam2", do_blur=True, do_intrusion=True) -> InferenceResult:
         now = time.time()
-        dt = min(0.2, max(0.0, now - getattr(self, "_last_ts", now)))
+        dt = min(0.2, max(0.0, now - self._last_ts))
         self._last_ts = now
 
-        # 1) 블러 적용 (네 blur.py 로직 그대로)
         if do_blur:
             frame, _ = self.blur.process(frame)
 
-        # 2) 사람 검출 → 좌석 FSM
-        dets = self._detect_persons(frame) if do_intrusion else []
         started = active = False
         seat_id = None
-        if do_intrusion:
-            person_bboxes = [d.bbox for d in dets]
-            started, active, seat_id = self.seat_engine.update(person_bboxes, dt)
+        person_boxes = []
 
+        if do_intrusion:
+            person_boxes = self._detect_persons(frame)
+            boxes = [d.bbox for d in person_boxes]
+            started, active, seat_id = self.tripwire_app.update(boxes, dt)
             if started:
                 self._corr_id = str(uuid.uuid4())
-                # TODO: 여기서 얼굴 인식/이벤트 포스트 등을 트리거할 수 있음.
-            
-                # [ADD] 침입 "전이" 순간에만 모니터 웹캠 스캔 시작(비동기)
                 self._kick_phone_thread(self._corr_id, seat_id)
 
         with self._lock:
             phone_flag = self._last_phone_capture
+            ident = self._last_identity
 
         return InferenceResult(
             frame=frame,
-            detections=dets,
+            detections=person_boxes,
             intrusion_started=started,
             intrusion_active=active,
             seat_id=seat_id,
-            identity=None,
-            identity_conf=None,
+            identity=ident[0] if ident else None,
+            identity_conf=ident[1] if ident else None,
             phone_capture=phone_flag,
-            meta={"camera_id": camera_id, "correlation_id": self._corr_id},
+            meta={"camera_id": camera_id, "correlation_id": self._corr_id, "seats": self.tripwire_app.seats},
         )
 
-# ====== 외부 진입점 ======
+
+# --- 진입점 함수 ---
 _ENGINE: Optional[InferenceEngine] = None
-def _engine() -> InferenceEngine:
+
+def _engine():
     global _ENGINE
     if _ENGINE is None:
         _ENGINE = InferenceEngine()
     return _ENGINE
 
-def run_inference_on_image(frame: np.ndarray,
-                           camera_id: str = "cam2",
-                           do_blur: bool = True,
-                           do_intrusion: bool = True) -> InferenceResult:
-    """
-    stream.py 프레임 루프에서 사용:
-        res = run_inference_on_image(frame, camera_id="cam2", do_blur=True, do_intrusion=True)
-        jpg = cv2.imencode(".jpg", res.frame, [...])
-    """
-    return _engine().process_frame(frame, camera_id=camera_id,
-                                   do_blur=do_blur, do_intrusion=do_intrusion)
+def run_inference_on_image(frame, camera_id="cam2", do_blur=True, do_intrusion=True):
+    return _engine().process_frame(frame, camera_id=camera_id, do_blur=do_blur, do_intrusion=do_intrusion)

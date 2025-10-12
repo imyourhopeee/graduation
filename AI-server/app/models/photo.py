@@ -3,12 +3,15 @@ import cv2
 from ultralytics import YOLO
 
 # ===== 설정 =====
-WEIGHTS = "C:/Users/DS/Documents/graduation/SOAT_main/runs/detect/train12/weights/best.pt"
+WEIGHTS = "C:/Users/DS/Documents/graduation/SOAT_main/runs/detect/train17/weights/best.pt"
 CAMERA_INDEX = 1
-CONF_THRES = 0.8        # 감지 신뢰도 기준 (이 이상이면 감지로 인정)
-PERSIST_SEC = 1.5       # 1.5초 연속 감지 시 이벤트 발생
+CONF_THRES = 0.65        # 감지 신뢰도 기준 (이 이상이면 감지로 인정) - 0.8 > 
+PERSIST_SEC = 1.0      # 1.5초 연속 감지 시 이벤트 발생
 HOLD_SEC = 2.0          # 이벤트 발생 후 문구 유지 시간(초)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# OpenCV 창 크기 설정
+WINDOW_W, WINDOW_H = 1280, 960
 
 def draw_center_text(img, text, scale=1.6, thickness=4, color=(40, 220, 40)):
     """중앙에 강조된 텍스트를 그림 (OpenCV 화면용)"""
@@ -27,6 +30,10 @@ def main():
     dwell_start = None   # 감지가 시작된 시각
     trigger_until = 0.0  # 이벤트 문구를 표시할 종료 시각
     last_conf = 0.0      # 최근 프레임의 최대 confidence
+
+    # 창 크기 미리 설정
+    cv2.namedWindow("Phone-Back Pose (cam 1)", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Phone-Back Pose (cam 1)", WINDOW_W, WINDOW_H)
 
     try:
         while True:
@@ -60,22 +67,24 @@ def main():
 
             # ---------------- 화면 표시 ----------------
             if dwell_start is not None and now < trigger_until:
-                # 이벤트 발생 상태
-                draw_center_text(frame, f"Photo Captured (conf {last_conf:.2f})")
+                # 이벤트 발생 상태 (최종 문구는 그대로 표시)
+                draw_center_text(frame, f"Photo Captured")
             elif dwell_start is not None:
-                # 이벤트 전 카운트다운
+                #이벤트 전 카운트다운 (conf 주석 처리)
                 remain = max(0.0, PERSIST_SEC - (now - dwell_start))
                 txt = f"Capturing pose... {remain:.1f}s left (conf {last_conf:.2f})"
                 cv2.putText(frame, txt, (20, 40), FONT, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(frame, txt, (20, 40), FONT, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                pass
             elif now < trigger_until:
                 # 이벤트 유지 시간
-                draw_center_text(frame, f"Photo Captured (conf {last_conf:.2f})")
+                draw_center_text(frame, f"Photo Captured")
             else:
-                # 감지도 없고 이벤트도 없을 때 → conf만 표시
+                #감지도 없고 이벤트도 없을 때 → conf 주석 처리
                 txt = f"Current conf {last_conf:.2f}"
                 cv2.putText(frame, txt, (20, 40), FONT, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(frame, txt, (20, 40), FONT, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                pass
 
             # 종료 안내
             cv2.putText(frame, "Press 'q' to quit", (20, frame.shape[0] - 20),

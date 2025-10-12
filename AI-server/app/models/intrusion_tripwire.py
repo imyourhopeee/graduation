@@ -1,33 +1,21 @@
 # intrusion_tripwire.py
-import argparse, json, time
+import argparse, json, time, os
 from dataclasses import dataclass, asdict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from pathlib import Path
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ==== 상수 설정 (요청사항) ====
-DWELL_SECONDS = 8.0   # 코어존 내 연속 체류해야 하는 시간(초)
-EXIT_SECONDS  = 1.5   # 코어존 밖 연속 이탈 시간(초) — 원하면 변경
+# ==== 상수 설정 ====
+DWELL_SECONDS = 5.0   # 코어존 내 연속 체류해야 하는 시간(초) - 도구 기본
+EXIT_SECONDS  = 1.5   # 코어존 밖 연속 이탈 시간(초)
 
 def now_ts(): return time.time()
 def draw_text(img, text, org, color=(255,255,255), scale=0.6, thickness=2):
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 def feet_point_xyxy(x1,y1,x2,y2): return int((x1+x2)/2), int(y2)
-
-def dist_to_segment(p, a, b):
-    ax, ay = a; bx, by = b; px, py = p
-    v = np.array([bx-ax, by-ay], np.float32)
-    w = np.array([px-ax, py-ay], np.float32)
-    v2 = float(v.dot(v))
-    if v2 < 1e-6: return float(np.linalg.norm(w)), 0.0
-    t = float(w.dot(v) / v2)
-    t_clamped = max(0.0, min(1.0, t))
-    closest = np.array([ax, ay], np.float32) + t_clamped * v
-    dist = float(np.linalg.norm(np.array([px,py], np.float32) - closest))
-    return dist, t
 
 @dataclass
 class SeatWire:
@@ -42,6 +30,8 @@ class SeatWire:
     state: str = "OUTSIDE"
     dwell_s: float = 0.0
     exit_s: float = 0.0
+    # 선택: seat_id를 외부에서 지정해줄 수 있도록 확장
+    seat_id: Optional[int] = None
 
     def y_near_far(self):
         y1, y2 = self.p1[1], self.p2[1]
@@ -90,36 +80,9 @@ class SeatWire:
 
         return in_span and inside_strip
 
-    def draw(self, img, debug=False):
-        cv2.line(img, self.p1, self.p2, (0,255,255), 2)  # 노란 좌석선
-        a = np.array(self.p1, np.float32); b = np.array(self.p2, np.float32)
-        v = b - a
-        if np.linalg.norm(v) > 1e-3:
-            n = np.array([-v[1], v[0]], np.float32)
-            n /= (np.linalg.norm(n) + 1e-6)
-            # 각 끝점 y에 맞는 깊이 (원근 보정)
-            d1 = self.depth_at_y(int(self.p1[1]))
-            d2 = self.depth_at_y(int(self.p2[1]))
-            # 안쪽 방향으로 사다리꼴 만들기
-            n_in = n * float(self.inward_sign)
-            poly = np.array([
-                (a + n_in * 0), (b + n_in * 0),
-                (b + n_in * d2), (a + n_in * d1)
-            ], np.int32)
-            overlay = img.copy()
-            cv2.fillPoly(overlay, [poly], (200, 0, 200))     # 보라색
-            cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
-            # 화살표(안쪽)
-            mid = ((self.p1[0]+self.p2[0])//2, (self.p1[1]+self.p2[1])//2)
-            tip = (int(mid[0] + n_in[0]*40), int(mid[1] + n_in[1]*40))
-            cv2.arrowedLine(img, mid, tip, (0,0,255), 2, tipLength=0.3)
-        if debug:
-            draw_text(img, f"inward={self.inward_sign}  depth(n/f)={self.d_near:.0f}/{self.d_far:.0f}",
-                    (self.p1[0], max(20,self.p1[1]-8)), (100,255,100), 0.55, 2)
-
 # 좌석 FSM
 def update_seat_fsm(seat: SeatWire, any_in_core: bool, dt: float,
-                    dwellSeconds=DWELL_SECONDS, exitSeconds=EXIT_SECONDS):
+                    dwellSeconds: float = DWELL_SECONDS, exitSeconds: float = EXIT_SECONDS):
     if seat.state == "OUTSIDE":
         seat.dwell_s = 0.0; seat.exit_s = 0.0
         if any_in_core:
@@ -148,7 +111,7 @@ def update_seat_fsm(seat: SeatWire, any_in_core: bool, dt: float,
 # 발좌표 EMA
 class EMA:
     def __init__(self, alpha=0.25):
-        self.alpha = alpha
+        self.alpha = float(alpha)
         self.val = None
     def update(self, p):
         v = np.array(p, np.float32)
@@ -156,7 +119,124 @@ class EMA:
         else: self.val = self.alpha*v + (1-self.alpha)*self.val
         return tuple(map(int, self.val))
 
+
+# =========================
+# 런타임용 TripwireApp (inference.py에서 사용)
 class TripwireApp:
+    def __init__(self, cam, seats, dwell_sec, on_intrusion):
+        self.cam = 0 if str(cam).strip() == "0" else cam
+        self.seats: List[SeatWire] = self._normalize_seats(seats)
+        self.dwell_sec = float(dwell_sec)
+        self.exit_sec = float(EXIT_SECONDS)
+        self.on_intrusion = on_intrusion
+        self.ema = EMA(alpha=float(os.getenv("EMA_ALPHA", "0.25")))
+        self.person_model = self._load_person_model()
+
+    def _load_person_model(self):
+        model_path = os.getenv("PERSON_MODEL", "yolov8n.pt")
+        try:
+            return YOLO(model_path)
+        except Exception as e:
+            print(f"[WARN] YOLO load failed: {e}")
+            return None
+
+    def _normalize_seats(self, seats):
+        out: List[SeatWire] = []
+        if not seats:
+            return out
+        for i, s in enumerate(seats):
+            if isinstance(s, SeatWire):
+                if s.seat_id is None: s.seat_id = i
+                out.append(s)
+            else:
+                # dict → SeatWire
+                out.append(SeatWire(
+                    p1=tuple(s["p1"]),
+                    p2=tuple(s["p2"]),
+                    b_near=float(s.get("b_near", 20.0)),
+                    b_far=float(s.get("b_far", 8.0)),
+                    inward_sign=int(s.get("inward_sign", 1)),
+                    d_near=float(s.get("d_near", 180.0)),
+                    d_far=float(s.get("d_far", 120.0)),
+                    seat_id=int(s.get("seat_id", i)),
+                ))
+        return out
+    
+    def update(self, person_bboxes: List[Tuple[int,int,int,int]], dt: float):
+        """
+        person_bboxes: [(x1,y1,x2,y2), ...]  (YOLO 결과)
+        dt: 이전 프레임과의 시간차(초)
+        return: (started: bool, active: bool, seat_id: Optional[int])
+        """
+        # 바운딩박스 → 발(foot) 좌표로 변환
+        feet_points = []
+        for (x1,y1,x2,y2) in person_bboxes:
+            fx, fy = feet_point_xyxy(x1,y1,x2,y2)
+            feet_points.append((fx, fy))
+
+        if feet_points:
+            if not hasattr(self, "_ema") or self._ema is None:
+                self._ema = EMA(alpha=0.25)
+            feet_points = [self._ema.update(fp) for fp in feet_points]
+
+        started = False
+        active = False
+        intruded_seat_id = None
+
+        # 좌석별 FSM 업데이트
+        for idx, s in enumerate(self.seats):
+            any_core = any(s.intruded(fp) for fp in feet_points)
+            prev = s.state  # "OUTSIDE" | "ENTERING" | "INTRUDED"
+
+            # 기존 FSM 로직 재사용
+            update_seat_fsm(s, any_core, dt, dwellSeconds=self.dwell_sec, exitSeconds=self.exit_sec)
+
+            if prev != "INTRUDED" and s.state == "INTRUDED":
+                started = True
+                intruded_seat_id = idx
+                # 콜백 연결되어 있으면 호출 (snapshot 등 필요 시 외부에서 넘겨라)
+                if callable(self.on_intrusion):
+                    ts = time.time() 
+                    seat = s.seat_id if s.seat_id is not None else idx
+                    try:
+                        self.on_intrusion(int(seat), ts, None)
+                    except Exception:
+                        pass
+
+            if s.state == "INTRUDED":
+                active = True
+                # 첫 INTRUDED 좌석을 대표로 사용
+                if intruded_seat_id is None:
+                    intruded_seat_id = idx
+
+        return started, active, intruded_seat_id
+
+    def set_config(self, seats=None, dwell_sec=None):
+        if seats is not None:
+            self.seats = self._normalize_seats(seats)
+            print(f"[TripwireApp] seats updated -> {len(self.seats)}")
+        if dwell_sec is not None:
+            self.dwell_sec = float(dwell_sec)
+            print(f"[TripwireApp] dwell updated -> {self.dwell_sec}s")
+
+    def _detect_person_bboxes(self, frame):
+        if self.person_model is None:
+            return []
+        r = self.person_model.predict(frame, verbose=False, conf=float(os.getenv("PERSON_CONF", "0.4")), classes=[0])[0]
+        h, w = frame.shape[:2]
+        boxes = []
+        if r and r.boxes is not None:
+            for b in r.boxes:
+                x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+                x1 = int(np.clip(x1,0,w-1)); x2 = int(np.clip(x2,0,w-1))
+                y1 = int(np.clip(y1,0,h-1)); y2 = int(np.clip(y2,0,h-1))
+                if x2 > x1 and y2 > y1:
+                    boxes.append((x1,y1,x2,y2))
+        return boxes
+
+# 도구/GUI용 TripwireTool (예전 TripwireApp 이름)
+
+class TripwireTool:
     def __init__(self, args):
         self.args = args
         self.model = YOLO(args.model)
@@ -203,140 +283,3 @@ class TripwireApp:
             for d in data
         ]
         print(f"[LOAD] {path} (seats={len(self.seats)})")
-
-    def on_mouse(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and self.add_mode:
-            self.temp_pts.append((int(x), int(y)))
-            if len(self.temp_pts) == 2:
-                p1, p2 = self.temp_pts
-                self.seats.append(SeatWire(p1, p2))
-                self.temp_pts.clear()
-                self.add_mode = False
-                print(f"[ADD] seat #{len(self.seats)}: {p1}->{p2}")
-
-    def run(self):
-        src = 0 if self.args.source.strip()=="0" else self.args.source
-        cap = cv2.VideoCapture(src)
-        if not cap.isOpened(): raise RuntimeError(f"소스를 열 수 없습니다: {self.args.source}")
-
-        win = "Tripwire (perpendicular-inside)"
-        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-        cv2.setMouseCallback(win, self.on_mouse)
-
-        fps = cap.get(cv2.CAP_PROP_FPS); 
-        if not fps or fps < 1: fps = 25.0
-        last_ts = time.time()
-
-        ema = EMA(alpha=0.25)
-
-        while True:
-            ok, frame = cap.read()
-            if not ok: break
-            now = time.time()
-            dt = max(1.0/fps, now - last_ts)
-            last_ts = now
-            if self.K is not None and self.dist is not None:
-                frame = cv2.undistort(frame, self.K, self.dist)
-
-            h, w = frame.shape[:2]
-            vis = frame.copy()
-
-            # YOLO(person)
-            results = self.model.predict(frame, verbose=False, conf=self.args.conf, classes=[self.person_cls])
-
-            feet_points = []
-            if results and results[0].boxes is not None:
-                for b in results[0].boxes:
-                    x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
-                    x1 = int(np.clip(x1,0,w-1)); x2 = int(np.clip(x2,0,w-1))
-                    y1 = int(np.clip(y1,0,h-1)); y2 = int(np.clip(y2,0,h-1))
-                    if x2 > x1 and y2 > y1:
-                        fx, fy = feet_point_xyxy(x1,y1,x2,y2)
-                        fx, fy = ema.update((fx, fy))  # EMA 적용
-                        feet_points.append((fx, fy))
-                        if self.debug:
-                            cv2.circle(vis, (fx,fy), 5, (0,255,0), -1)
-                        cv2.rectangle(vis, (x1,y1), (x2,y2), (120,120,120), 2)
-
-            if self.add_mode and self.temp_pts:
-                cv2.circle(vis, self.temp_pts[0], 5, (0,200,255), -1)
-
-            intruded_seats = set()
-
-            for i, s in enumerate(self.seats, 1):
-                s.draw(vis, debug=self.debug)
-
-                # 이 좌석 코어존 안에 '누군가' 있는가?
-                any_core = any(s.intruded(fp) for fp in feet_points)
-
-                prev = s.state
-                update_seat_fsm(s, any_core, dt, dwellSeconds=DWELL_SECONDS, exitSeconds=EXIT_SECONDS)
-
-                # === 상태/HUD 표시 (요청사항: 7초까지 카운트) ===
-                if s.state in ["OUTSIDE", "ENTERING"]:
-                    draw_text(
-                        vis,
-                        f"Seat {i} [{s.state}] {s.dwell_s:.1f}s / {DWELL_SECONDS:.1f}s",
-                        (s.p1[0], s.p1[1]+40),
-                        (0, 200, 255), 0.6, 2
-                    )
-                elif s.state == "INTRUDED":
-                    draw_text(
-                        vis,
-                        f"Seat {i} INTRUDED ({s.dwell_s:.1f}s)",
-                        (s.p1[0], s.p1[1]+40),
-                        (0, 0, 255), 0.7, 2
-                    )
-
-                # 상태 전이가 'INTRUDED'로 바뀌는 순간 1회 이벤트
-                if prev != "INTRUDED" and s.state == "INTRUDED":
-                    print(f"[EVENT] {time.strftime('%H:%M:%S')}  SEAT#{i} INTRUSION")
-
-                if s.state == "INTRUDED":
-                    intruded_seats.add(i-1)
-
-            if intruded_seats:
-                draw_text(vis, "INTRUSION!", (10, h-20), (0,0,255), 0.9, 3)
-
-            # help
-            if self.help_on:
-                draw_text(vis, "a:Add seat (click 2pts) | t:flip inward | x:delete last | s:save | l:load | d:debug | h:help | q:quit",
-                          (10, 26), (30,220,30), 0.55, 2)
-
-            cv2.imshow(win, vis)
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord('q'): break
-            elif k == ord('a'):
-                self.add_mode = True; self.temp_pts.clear()
-                print("[MODE] click two points along the yellow line")
-            elif k == ord('t'):
-                if self.seats:
-                    self.seats[-1].inward_sign *= -1
-                    print(f"[TOGGLE] seat#{len(self.seats)} inward_sign -> {self.seats[-1].inward_sign}")
-            elif k == ord('x'):
-                if self.seats:
-                    removed = self.seats.pop()
-                    print(f"[DEL] removed seat {removed.p1}->{removed.p2}")
-            elif k == ord('s'):
-                self.save(self.args.config)
-            elif k == ord('l'):
-                self.load(self.args.config)
-            elif k == ord('d'):
-                self.debug = not self.debug
-            elif k == ord('h'):
-                self.help_on = not self.help_on
-
-        cap.release(); cv2.destroyAllWindows()
-
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", type=str, default="0")
-    ap.add_argument("--model", type=str, default="yolov8n.pt")
-    ap.add_argument("--conf", type=float, default="0.4")
-    ap.add_argument("--camera_K", type=str, default="")
-    ap.add_argument("--camera_dist", type=str, default="")
-    ap.add_argument("--config", type=str, default="tripwire_perp.json")
-    return ap.parse_args()
-
-if __name__ == "__main__":
-    TripwireApp(parse_args()).run()
