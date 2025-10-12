@@ -4,19 +4,26 @@
   "description": "통신, 로그 저장 및 조회, (관리자) 로그인",
   "keywords": [],
   "author": "",
+  "type": "module",
   "scripts": {
-    "dev": "nodemon app.js"
+    "dev": "nodemon app.js",
+    "start": "node app.js",
+    "db:init": "node db/init.js"
   },
   "license": "ISC",
   "devDependencies": {
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.10",
+    "socket.io-client": "^4.8.1"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.0.1",
+    "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "socket.io": "^4.8.1",
+    "zod": "^4.1.11"
   }
 }

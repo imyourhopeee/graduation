@@ -51,46 +51,36 @@ import jwt from "jsonwebtoken";
 //   }
 // }
 export function verifyAI(req, res, next) {
+  const h = req.headers.authorization || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) {
+    console.log("[verifyAI] no Authorization header");
+    return res.status(401).json({ message: "no bearer" });
+  }
+  const token = m[1];
 
-   const h = req.headers.authorization || "";
-   if (!h) {
-     console.log("[verifyAI] no Authorization header at all");
-     return res.status(401).json({ message: "no Authorization header" });
-   }
-   const m = h.match(/^Bearer\s+(.+)$/i);
+  try {
+    const payload = jwt.verify(token, process.env.AI_JWT_SECRET, {
+      algorithms: ["HS256"],
+      clockTolerance: 60,
+    });
 
-   if (!m) {
-     console.log("[verifyAI] malformed Authorization header:", h.slice(0, 20) + "...");
-     return res.status(401).json({ message: "malformed bearer header" });
-   }
-   const token = m[1];
+    // 추가: payload 주요 클레임 로그
+    console.log("[verifyAI] ok sub=%s role=%s exp=%s now=%s",
+      payload?.sub, payload?.role, payload?.exp, Math.floor(Date.now()/1000));
 
-   if (!process.env.AI_JWT_SECRET) {
-     console.error("[verifyAI] AI_JWT_SECRET missing");
-     return res.status(500).json({ message: "server misconfigured: AI_JWT_SECRET" });
-   }
-
-   try {
-     const payload = jwt.verify(token, process.env.AI_JWT_SECRET, {
-       algorithms: ["HS256"],
-       clockTolerance: 60,
-     });
-
-     console.log("[verifyAI] ok sub=%s role=%s exp=%s now=%s",
-       payload?.sub, payload?.role, payload?.exp, Math.floor(Date.now()/1000));
-
-     if (payload?.role !== "ai") {
-       console.log("[verifyAI] role not ai:", payload?.role);
-       return res.status(403).json({ message: "invalid ai token", reason: "role" });
-     }
-     req.ai = payload;
-     return next();
-   } catch (e) {
-     console.error("[verifyAI] verify failed:", e.name, e.message);
-     return res.status(401).json({ message: "invalid ai token", reason: e.name });
-   }
+    if (payload?.role !== "ai") {
+      console.log("[verifyAI] role not ai:", payload?.role);
+      return res.status(403).json({ message: "role not ai" });
+    }
+    req.ai = payload;
+    return next();
+  } catch (e) {
+    // ✅ 추가: 오류 원인 상세 출력 (만료/서명오류/형식오류 등)
+    console.error("[verifyAI] verify failed:", e.name, e.message);
+    return res.status(401).json({ message: "unauthorized", reason: e.name });
+  }
 }
-
 
 /**
  * 프론트(사용자) → Event-server 호출용
@@ -124,8 +114,7 @@ export function requireUser(req, res, next) {
       clockTolerance: 30,
     });
 
-     console.log("[requireUser] ok sub=%s role=%s", payload?.sub ?? payload?.id, payload?.role);
-     req.user = payload; // 예: sub, role 등
+    req.user = payload; // 예: sub, role 등
     return next();
   } catch (e) {
     console.error("[requireUser] verify fail =>", {

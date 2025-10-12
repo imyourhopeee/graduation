@@ -1,53 +1,99 @@
-// 실제 DB에 데이터를 저장하는 쿼리 로직
+// models/eventModel.js
+import { pool } from "../db/index.js";
 
-// models/eventModel.js (CommonJS)
-const pool = require("../db"); // pool.query 사용 (당신 코드와 동일 컨벤션)
+// ──────────────────────────────────────────────────────────────
+// 현재 events 테이블 컬럼(스크린샷 기준):
+// id, started_at, ended_at, duration_sec, meta(JSONB), created_at,
+// event_type, person_id, confidence
+// ──────────────────────────────────────────────────────────────
 
-// --- 규칙 파라미터 ---
-const STAY_SEC = Number(process.env.STAY_SEC || 3);
-const DEDUP_WINDOW_SEC = Number(process.env.DEDUP_WINDOW_SEC || 10);
+// ✅ DB에 들어갈 행으로 컨트롤러 payload를 정규화 (핵심)
+function mapPayloadToRow(evt = {}) {
+  // controller.normalizeEventBody() 기준 매핑
+  const event_type =
+    typeof evt.event_type === "string"
+      ? evt.event_type
+      : typeof evt.type === "string"
+      ? evt.type
+      : undefined;
 
-// camera_id -> track_id -> { enterAt, lastSeenAt, zoneId }
-const trackState = new Map();
-// 이벤트 중복 억제 키 -> lastEmittedAt(sec)
-const lastEmit = new Map();
+  // meta JSONB 구성
+  const seat_no =
+    evt.seat_id ?? evt?.meta?.seat_no ?? null;
+  const device_id =
+    evt.camera_id ?? evt?.meta?.device_id ?? null;
 
-function dedupKey(device_id, track_id, type, zone_id) {
-  return `${device_id}:${track_id}:${type}:${zone_id || "-"}`;
+  const meta = {
+    ...(evt.meta || {}),
+    ...(seat_no != null ? { seat_no: Number(seat_no) } : {}),
+    ...(device_id != null ? { device_id: String(device_id) } : {}),
+  };
+
+  const row = {
+    event_type,                                  // TEXT
+    started_at: evt.started_at ?? null,          // TIMESTAMPTZ
+    ended_at: evt.ended_at ?? null,              // TIMESTAMPTZ
+    duration_sec: evt.duration_sec ?? null,      // INT
+    person_id: evt.person_id ?? null,            // TEXT
+    confidence: evt.confidence ?? null,          // FLOAT
+    meta,                                        // JSONB
+    // created_at: DB default NOW()
+  };
+
+  // controller에서 at만 있고 started/ended 없을 때 ended_at 채우는 로직이 있으므로
+  // 여긴 그대로 둡니다(컨트롤러에서 이미 보정했다는 가정).
+  return row;
 }
 
-// === DB I/O ===
-async function saveEvent(row, client = pool) {
-  const q = `
-    INSERT INTO events
-      (type, device_id, zone_id, track_id, user_label, started_at, ended_at, duration_sec, meta)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    RETURNING id;
+// 실제 DB에 존재하는 컬럼만 명시
+const EVENT_COLUMNS = [
+  "event_type",
+  "started_at",
+  "ended_at",
+  "duration_sec",
+  "person_id",
+  "confidence",
+  "meta",
+  // created_at 은 DB DEFAULT NOW()면 생략
+];
+
+/** 안전한 INSERT: DB 컬럼 화이트리스트만 사용 */
+export async function saveEvent(row, client = pool) {
+  const cols = [];
+  const vals = [];
+  const phs = [];
+
+  for (const col of EVENT_COLUMNS) {
+    if (row[col] !== undefined) {
+      cols.push(col);
+      vals.push(row[col]);
+      phs.push(`$${vals.length}`);
+    }
+  }
+  if (cols.length === 0) throw new Error("No valid event fields to insert");
+
+  const sql = `
+    INSERT INTO events (${cols.join(",")})
+    VALUES (${phs.join(",")})
+    RETURNING id
   `;
-  const v = [
-    row.type,
-    row.device_id || null,
-    row.zone_id || null,
-    row.track_id || null,
-    row.user_label || null,
-    row.started_at || null,
-    row.ended_at || null,
-    row.duration_sec || null,
-    row.meta || {},
-  ];
-  const { rows } = await client.query(q, v);
+  const { rows } = await client.query(sql, vals);
   return rows[0].id;
 }
 
-async function saveEventsBulk(events) {
+/** 컨트롤러에서 사용하는 단건 INSERT */
+export async function insertEvent(evt) {
+  const row = mapPayloadToRow(evt);     // ✅ 컨트롤러 payload → DB행
+  return saveEvent(row);
+}
+
+export async function saveEventsBulk(events) {
   if (!events?.length) return [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const ids = [];
-    for (const e of events) {
-      ids.push(await saveEvent(e, client));
-    }
+    for (const e of events) ids.push(await insertEvent(e)); // ✅ mapPayloadToRow 경유
     await client.query("COMMIT");
     return ids;
   } catch (err) {
@@ -58,72 +104,53 @@ async function saveEventsBulk(events) {
   }
 }
 
-// === 규칙 엔진: DetectionBatch -> {persist, realtime} ===
-/**
- * @param {object} batch  DetectionBatch(JSON) from AI-server
- * @returns {{ persist: Array<object>, realtime: object }}
- */
-function applyRules(batch) {
-  const device_id = batch.camera_id;
-  const ts = batch.timestamp;
+/** id로 조회 (컨트롤러가 원하는 형태로 가공해서 반환) */
+export async function selectEventById(id) {
+  const q = `
+    SELECT id, event_type, started_at, ended_at, duration_sec,
+           person_id, confidence, meta, created_at
+      FROM events
+     WHERE id = $1
+  `;
+  const { rows } = await pool.query(q, [id]);
+  const r = rows[0];
+  if (!r) return null;
 
-  if (!trackState.has(device_id)) trackState.set(device_id, new Map());
-  const camMap = trackState.get(device_id);
+  // 컨트롤러가 기대하는 필드로 재가공
+  const type = r.event_type;
+  const seat_id =
+    r.meta && r.meta.seat_no != null ? Number(r.meta.seat_no) : null;
+  const camera_id =
+    r.meta && r.meta.device_id != null ? String(r.meta.device_id) : null;
 
-  const persist = [];
-
-  for (const det of batch.detections || []) {
-    const tid = det.track_id;
-    const state = camMap.get(tid) || {
-      enterAt: ts,
-      lastSeenAt: ts,
-      zoneId: null,
-    };
-    state.lastSeenAt = ts;
-
-    // TODO: ROI 포함 여부로 zoneId 판정 (현재는 null)
-    const zoneId = state.zoneId;
-
-    // 체류(Stay) 판단
-    const dwellSec = Math.max(
-      0,
-      (new Date(ts) - new Date(state.enterAt)) / 1000
-    );
-    if (dwellSec >= STAY_SEC) {
-      const k = dedupKey(device_id, tid, "stay", zoneId);
-      const nowSec = Date.now() / 1000;
-      const last = lastEmit.get(k) || 0;
-
-      if (nowSec - last >= DEDUP_WINDOW_SEC) {
-        persist.push({
-          type: "stay",
-          device_id,
-          zone_id: zoneId,
-          track_id: tid,
-          user_label: det?.face?.label || det?.reid?.densenet_label || null,
-          started_at: state.enterAt,
-          ended_at: ts,
-          duration_sec: Math.floor(dwellSec),
-          meta: { bbox: det.bbox, score: det.score },
-        });
-        lastEmit.set(k, nowSec);
-      }
-    }
-
-    camMap.set(tid, state);
-  }
-
-  const realtime = {
-    camera_id: device_id,
-    timestamp: ts,
-    count: batch.detections?.length || 0,
+  return {
+    id: r.id,
+    type,
+    seat_id,
+    camera_id,
+    meta: r.meta || {},
+    started_at: r.started_at,
+    ended_at: r.ended_at,
+    duration_sec: r.duration_sec,
+    person_id: r.person_id,
+    confidence: r.confidence,
+    created_at: r.created_at,
   };
-  return { persist, realtime };
 }
 
-module.exports = {
-  // 컨트롤러에서 바로 사용
-  applyRules,
-  saveEvent,
-  saveEventsBulk,
-};
+/** 최근 침입 조회 (프론트 대시보드용) */
+export async function selectRecentIntrusions(sinceISO) {
+  const { rows } = await pool.query(
+    `SELECT e.id, e.event_type, e.started_at, e.ended_at, e.duration_sec,
+            e.person_id, e.confidence, e.meta,
+            s.seat_no, s.owner_user_id, s.name AS seat_name
+       FROM events e
+       LEFT JOIN seats s
+         ON s.seat_no = (e.meta->>'seat_no')::int
+      WHERE e.event_type = 'intrusion'
+        AND e.started_at >= $1
+      ORDER BY e.started_at DESC`,
+    [sinceISO]
+  );
+  return rows;
+}
