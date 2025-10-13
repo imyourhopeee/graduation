@@ -7,8 +7,21 @@ import cors from "cors";
 // import cookieParser from "cookie-parser";
 import { assertOffeye } from './db/index.js'; 
 import { setupSocket } from "./socket/socket.js";
-
+import pg from "pg";
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DB_URL });
 const app = express();
+
+(async () => {
+  try {
+    const r = await pool.query("select current_database() db, current_schema() sch, now() now");
+    console.log("[DB] url=", process.env.DB_URL);
+    console.log("[DB] connect ok db=%s schema=%s now=%s", r.rows[0].db, r.rows[0].sch, r.rows[0].now);
+  } catch (e) {
+    console.error("[DB] connect fail", e);
+  }
+})();
+
 // app.js 맨 위쪽 미들웨어들 전에 추가함!
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.originalUrl}`);
@@ -22,7 +35,8 @@ const origins = (process.env.CORS_ORIGIN || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-app.use(
+//<지선 추가함. 지워도ㅇㅋㅇㅋ
+  app.use(
   cors({
     origin: origins.length ? origins : ["http://localhost:3000"],
     methods: ["GET","POST","PUT","DELETE","OPTIONS"], //추가
@@ -30,8 +44,14 @@ app.use(
     credentials: true,
   })
 );
+//>
 
 app.use(express.json({ limit: "5mb" }));
+
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
 // health
 app.get("/healthz", (req, res) => res.json({ status: "ok" }));

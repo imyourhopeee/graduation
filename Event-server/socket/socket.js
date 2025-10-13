@@ -12,6 +12,7 @@ export function setupSocket(server) {
       origin: ["http://localhost:3000"],
       credentials: true,
     },
+    path: "/socket.io",
     transports: ["polling", "websocket"],
     upgrade: true,   // 필요하면 강제
   });

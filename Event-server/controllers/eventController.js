@@ -1,10 +1,63 @@
 // controllers/eventController.js 
 import { z } from "zod";
 import { insertEvent, selectRecentIntrusions, selectEventById } from "../models/eventModel.js";
+import { pool } from "../db/index.js";
 
-// 이미 있던 함수들…
-export async function ingestDetections(req, res) { /* 그대로 */ }
-export async function listEvents(req, res) { /* 그대로 */ }
+export async function ingestDetections(req, res) {
+  try {
+    const payload = req.body;
+    const count = Array.isArray(payload) ? payload.length : (payload ? 1 : 0);
+    console.log("[/detections] received", count, "items");
+    return res.status(200).json({ ok: true, count });
+  } catch (e) {
+    console.error("[/detections] error", e);
+    return res.status(400).json({ ok: false, error: "bad_payload" });
+  }
+}
+export async function listEvents(req, res) {
+  try {
+    const limit = Math.min(Number(req.query.limit || 50), 200);
+    const q = `
+      select
+        id,
+        lower(event_type) as event_type,
+        started_at,
+        ended_at,
+        created_at,
+        meta
+      from events
+      order by id desc
+      limit $1
+    `;
+    const rs = await pool.query(q, [limit]);
+
+    const items = rs.rows.map(r => {
+      // at(초) 계산: ended > started > created
+      const at =
+        Math.floor(
+          new Date(r.ended_at || r.started_at || r.created_at || Date.now()).getTime() / 1000
+        );
+
+      const m = typeof r.meta === "string" ? safeJson(r.meta) : (r.meta || {});
+      return {
+            id: r.id,
+            type: r.event_type,           // 프론트가 type || event_type 사용
+            event_type: r.event_type,
+            seat_id: m.seat_no ?? null,   // ← meta에서 꺼냄
+            camera_id: m.device_id ?? null,
+            at,
+            meta: m,
+            started_at: r.started_at,
+            ended_at: r.ended_at,
+      };
+    });
+
+    return res.json(items);
+  } catch (e) {
+    console.error("[listEvents] error", e);
+    return res.status(500).json({ ok: false, error: "query_failed" });
+  }
+}
 
 // ✅ meta 문자열 방어 파서
 function safeJson(x) {
@@ -175,24 +228,61 @@ export async function addEvent(req, res) {
     }
 
     // 실시간 소켓 브로드캐스트
+    // try {
+    //   const io = req.app.get("socket");
+    //   if (io) {
+    //     io.emit("event", {
+    //       type: r.type,
+    //       seat_id: r.seat_id ?? null,
+    //       camera_id: r.camera_id ?? null,
+    //       at: Math.floor(
+    //         new Date(r.created_at || r.started_at || r.ended_at || atISO).getTime() / 1000
+    //       ),
+    //       meta: typeof r.meta === "string" ? safeJson(r.meta) : (r.meta ?? {}),
+    //       started_at: r.started_at,
+    //       ended_at: r.ended_at,
+    //     });
+    //   }
+    // } catch (e) {
+    //   console.warn("[addEvent] socket emit skipped:", e?.message);
+    // }
     try {
-      const io = req.app.get("io");
-      if (io) {
-        io.emit("event", {
-          type: r.type,
-          seat_id: r.seat_id ?? null,
-          camera_id: r.camera_id ?? null,
-          at: Math.floor(
-            new Date(r.created_at || r.started_at || r.ended_at || atISO).getTime() / 1000
-          ),
-          meta: typeof r.meta === "string" ? safeJson(r.meta) : (r.meta ?? {}),
-          started_at: r.started_at,
-          ended_at: r.ended_at,
-        });
-      }
+      const io = req.app.get("socket"); // app.js에서 app.set("socket", socketApi)
+      if (!io) throw new Error("socket instance not found");
+
+      // 원본 r 보강해서 프론트가 쓰기 쉬운 공통 형태로 정규화
+      const atSec =
+        Math.floor(
+          new Date(
+            r.at ||
+            r.created_at ||
+            r.ended_at ||
+            r.started_at ||
+            atISO // 너희 코드 상단에서 만든 ISO
+          ).getTime() / 1000
+        ) || Math.floor(Date.now() / 1000);
+
+      const ev = {
+        id: r.id ?? undefined,
+        type: (r.type ?? r.event_type ?? "").toLowerCase(),   // "intrusion_started" 등
+        event_type: (r.type ?? r.event_type ?? "").toLowerCase(),
+        seat_id: r.seat_id ?? r.meta?.seat_no ?? null,
+        camera_id: r.camera_id ?? r.meta?.device_id ?? null,
+        correlation_id: r.correlation_id ?? r.meta?.correlation_id ?? undefined,
+        at: atSec,
+        meta: typeof r.meta === "string" ? safeJson(r.meta) : (r.meta ?? {}),
+        started_at: r.started_at ?? null,
+        ended_at: r.ended_at ?? null,
+      };
+      io.emit("event", ev);
+
+      // 2) 타입별 채널도 함께 (프론트가 특정 채널만 듣는 경우 대비)
+      if (ev.type) io.emit(ev.type, ev);
+      if (ev.event_type && ev.event_type !== ev.type) io.emit(ev.event_type, ev);
     } catch (e) {
       console.warn("[addEvent] socket emit skipped:", e?.message);
     }
+
 
     // 최종 응답
     return res.status(201).json({
