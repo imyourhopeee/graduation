@@ -3,7 +3,8 @@ if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
 from dotenv import load_dotenv
-load_dotenv()  # fastapi가 .env를 읽을 수 있도록 추가
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env") # fastapi가 .env를 읽을 수 있도록 추가
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

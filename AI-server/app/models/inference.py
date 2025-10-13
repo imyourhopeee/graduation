@@ -87,27 +87,6 @@ class InferenceEngine:
         self._corr_id = None
         self._last_identity = None
 
-    # def _load_from_files(self) -> TripwireApp:
-    #     # 좌석 정보 로드
-    #     seats = []
-    #     if Path(SEATS_JSON_PATH).exists():
-    #         try:
-    #             data = json.loads(Path(SEATS_JSON_PATH).read_text(encoding="utf-8"))
-    #             seats = [SeatWire(**d) for d in data]
-    #         except Exception as e:
-    #             print("[LOAD SEATS FAIL]", e)
-
-    #     # dwell 시간 로드
-    #     dwell_sec = DWELL_SECONDS
-    #     if Path(DWELL_JSON_PATH).exists():
-    #         try:
-    #             data = json.loads(Path(DWELL_JSON_PATH).read_text(encoding="utf-8"))
-    #             dwell_sec = float(data.get("seconds", DWELL_SECONDS))
-    #         except Exception as e:
-    #             print("[LOAD DWELL FAIL]", e)
-
-    #     return TripwireApp(cam=None, seats=seats, dwell_sec=dwell_sec, on_intrusion=self._post_intrusion_event)
-
     def _load_from_files(self) -> TripwireApp:
     # 좌석 정보 로드 (NULL/옛 키 정리)
         seats = []
@@ -280,17 +259,31 @@ class InferenceEngine:
                 ident = self._last_identity
             user_label = ident[0] if ident else None
             user_conf  = ident[1] if ident else None
-            ts = timestamp or time.time()
+
+            end_ts = timestamp or time.time()
+            start_ts = end_ts - self.tripwire_app.dwell_sec
+
+            # ISO8601로 맞춤 (이벤트 서버의 duration 계산과 대시보드 표시가 정확해짐)
+            started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
+            ended_iso   = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts))
+
             payload = {
                 "type": "intrusion",
-                "device_id": "cam0",
-                "zone_id": int(seat_id) if seat_id is not None else None,
-                "user_label": user_label,
-                "identity_conf": user_conf,
-                "started_at": ts - self.tripwire_app.dwell_sec,
-                "ended_at": ts,
-                "meta": {"dwell_sec": self.tripwire_app.dwell_sec}
+                "seat_id": int(seat_id) if seat_id is not None else None,  # ← 표준 키
+                "camera_id": os.getenv("CAMERA_ID", "cam0"),                # ← 표준 키
+                "person_id": user_label,                                    # ← 표준 키
+                "confidence": user_conf,
+                "started_at": started_iso,
+                "ended_at": ended_iso,
+                "duration_sec": round(end_ts - start_ts, 1),
+                "meta": {
+                    "seat_no": int(seat_id) if seat_id is not None else None,
+                    "device_id": os.getenv("CAMERA_ID", "cam0"),
+                    "user_label": user_label,
+                    "dwell_sec": self.tripwire_app.dwell_sec,
+                },
             }
+
             url = f"{EVENT_BASE.rstrip('/')}/{EVENT_PATH.lstrip('/')}"
             ai_key = os.getenv("AI_SHARED_KEY")
             headers = {"X-AI-Key": ai_key} if ai_key else {}
@@ -299,6 +292,7 @@ class InferenceEngine:
             r.raise_for_status()
         except Exception as e:
             print("[EVENT POST FAIL]", e)
+
 
     # --- 메인 추론 ---
     def process_frame(self, frame: np.ndarray, camera_id="cam2", do_blur=True, do_intrusion=True) -> InferenceResult:
@@ -316,7 +310,14 @@ class InferenceEngine:
         if do_intrusion:
             person_boxes = self._detect_persons(frame)
             boxes = [d.bbox for d in person_boxes]
-            started, active, seat_id = self.tripwire_app.update(boxes, dt)
+            try:
+                ret = self.tripwire_app.update(boxes, dt)
+                if not isinstance(ret, tuple) or len(ret) != 3:
+                    raise TypeError("Tripwire.update returned invalid")
+                started, active, seat_id = ret
+            except Exception as e:
+                print("[inference] Tripwire.update() failed:", e)
+                started, active, seat_id = False, False, None
             if started:
                 self._corr_id = str(uuid.uuid4())
                 self._kick_phone_thread(self._corr_id, seat_id)

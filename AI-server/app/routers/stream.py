@@ -4,6 +4,7 @@ import os
 import asyncio
 import platform
 import json
+import types
 from pathlib import Path
 import jwt
 import numpy as np
@@ -28,68 +29,176 @@ SESSION = requests.Session()
 
 _AI_JWT = None
 _AI_JWT_EXP = 0
+_AI_JWT_KEY = None  # (secret, camera_id)을 기억해서 키가 바뀌면 재발급
 _SENT_STARTED: set[str] = set()
 _SENT_IDENTITY: set[str] = set()
 
 def _get_ai_token(camera_id: str = "cam2") -> str:
     """AI 역할용 JWT를 캐싱해서 사용."""
-    global _AI_JWT, _AI_JWT_EXP
+    global _AI_JWT, _AI_JWT_EXP, _AI_JWT_KEY
+    secret = os.getenv("AI_JWT_SECRET", "changeme")
     now = int(time.time())
-    # 토큰이 없거나 만료 임박(30초 이내)이면 재발급
-    if (not _AI_JWT) or (now > (_AI_JWT_EXP - 30)):
+    key = (secret, camera_id)
+
+    need_new = (
+        _AI_JWT is None
+        or (_AI_JWT_EXP - 30) <= now
+        or _AI_JWT_KEY != key
+    )
+
+    if need_new:
         payload = {
-            "role": "ai",
+            "sub": "ai",
+            "role": "ai",           # verifyAI가 소문자 'ai' 요구 → 확실히 소문자로
             "camera_id": camera_id,
             "iat": now,
-            "exp": now + 60 * 30,  # 30분 유효 (주석은 10분이었는데 실제값과 맞춤)
+            "exp": now + 60 * 5,    # 캐시/검증 문제 줄이려 5분으로 단축 (원하면 30분으로)
         }
-        tok = jwt.encode(payload, AI_JWT_SECRET, algorithm="HS256")
-        if isinstance(tok, bytes):  # PyJWT v1 대비
+        tok = jwt.encode(payload, secret, algorithm="HS256")
+        if isinstance(tok, bytes):
             tok = tok.decode("utf-8")
         _AI_JWT = tok
         _AI_JWT_EXP = payload["exp"]
+        _AI_JWT_KEY = key
+
+        print(f"[AI_TOKEN] issued role=ai cam={camera_id} exp={_AI_JWT_EXP} secret_fpr={hash(secret)%100000:05d}")
 
     return _AI_JWT
 
+    # # 토큰이 없거나 만료 임박(30초 이내)이면 재발급
+    # if (not _AI_JWT) or (now > (_AI_JWT_EXP - 30)):
+    #     payload = {
+    #         "sub": "ai",
+    #         "role": "ai",
+    #         "camera_id": camera_id,
+    #         "iat": now,
+    #         "exp": now + 60 * 30,  # 30분 유효 (주석은 10분이었는데 실제값과 맞춤)
+    #     }
+    #     tok = jwt.encode(payload, AI_JWT_SECRET, algorithm="HS256")
+    #     if isinstance(tok, bytes):  # PyJWT v1 대비
+    #         tok = tok.decode("utf-8")
+    #     _AI_JWT = tok
+    #     _AI_JWT_EXP = payload["exp"]
+
+    # return _AI_JWT
+
+def _post_event(payload: dict, camera_id: str = "cam0") -> None:
+    base = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
+    url = f"{base.rstrip('/')}/events"
+
+    # 토큰 생성
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": "ai", "role": "ai", "camera_id": camera_id, "iat": now, "exp": now + 300},
+        AI_JWT_SECRET,
+        algorithm="HS256",
+    )
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+
+    body = dict(payload)
+    body.setdefault("camera_id", camera_id)
+    body.setdefault("at", now)
+
+    # 헤더 구성
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-AI-Token": token,
+        "Content-Type": "application/json",
+    }
+
+    # 🔍 디버그용 로그 추가 — 실제 어떤 토큰/URL로 보내는지 확인
+    print(f"[POST_EVENT] → {url}")
+    print(f"[POST_EVENT] headers.Authorization = Bearer {token[:40]}...")  # 앞부분만
+    print(f"[POST_EVENT] payload = {body}")
+
+    try:
+        r = SESSION.post(url, json=body, headers=headers, timeout=5)
+        if r.status_code == 401:
+            print("[POST_EVENT] ⚠️ 401 Unauthorized — retrying without X-AI-Token header...")
+            alt_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            r = SESSION.post(url, json=body, headers=alt_headers, timeout=5)
+
+        if 200 <= r.status_code < 300:
+            print(f"[AI→EVENT] ✅ {r.status_code} {body.get('type')}")
+        else:
+            print(f"[AI→EVENT] ❌ {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[AI→EVENT] EXC {e.__class__.__name__}: {e}")
+
+# def _post_event(payload: dict, camera_id: str = "cam0") -> None:
+#     # .env 키를 너희 이벤트 서버 명세에 맞춤 (EVENT_SERVER_URL 사용)
+#     base = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
+#     url = f"{base.rstrip('/')}/events"
+
+#     # 토큰은 HS256, role=ai, camera_id 포함
+#     now = int(time.time())
+#     token = jwt.encode(
+#         {"role": "ai", "camera_id": camera_id, "iat": now, "exp": now + 300},
+#         AI_JWT_SECRET,
+#         algorithm="HS256",
+#     )
+#     if isinstance(token, bytes):
+#         token = token.decode("utf-8")
+
+#     body = dict(payload)
+#     body.setdefault("camera_id", camera_id)
+#     body.setdefault("at", now)
+
+#     # 여러 서버 구현을 모두 만족시키도록 인증을 넉넉하게 넣음
+#     headers = {
+#         "Authorization": f"Bearer {token}",
+#         "X-AI-Token": token,                 # 미들웨어가 이 헤더를 보는 경우 대비
+#         "Content-Type": "application/json",
+#     }
+
+    try:
+        r = SESSION.post(url, json=body, headers=headers, timeout=5)
+        if r.status_code == 401:
+            # 혹시 Authorization만 허용/불허가 섞인 경우를 대비한 2차 시도
+            alt_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            r = SESSION.post(url, json=body, headers=alt_headers, timeout=5)
+
+        if 200 <= r.status_code < 300:
+            print(f"[AI→EVENT] {r.status_code} {body.get('type')}")
+        else:
+            print(f"[AI→EVENT] {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[AI→EVENT] EXC {e.__class__.__name__}: {e}")
+
+
 # def _post_event(payload: dict, camera_id: str = "cam2") -> None:
+#     global _AI_JWT, _AI_JWT_EXP
 #     try:
 #         tok = _get_ai_token(camera_id)
 #         headers = {"Authorization": f"Bearer {tok}"}
-#         SESSION.post(EVENT_URL, json=payload, headers=headers, timeout=2.0)
-#     except Exception:
-#         pass
+#         body = dict(payload)
+#         body.setdefault("camera_id", camera_id)
+#         if "at" not in body and "timestamp" not in body:
+#             body["at"] = int(time.time())
 
-def _post_event(payload: dict, camera_id: str = "cam2") -> None:
-    global _AI_JWT, _AI_JWT_EXP
-    try:
-        tok = _get_ai_token(camera_id)
-        headers = {"Authorization": f"Bearer {tok}"}
-        body = dict(payload)
-        body.setdefault("camera_id", camera_id)
-        if "at" not in body and "timestamp" not in body:
-            body["at"] = int(time.time())
+#         # 1차 요청
+#         r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
 
-        # 1차 요청
-        r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
+#         # 토큰 만료 시 1회만 재시도
+#         if r.status_code == 401:
+#             _AI_JWT = None
+#             _AI_JWT_EXP = 0
+#             tok = _get_ai_token(camera_id)
+#             headers["Authorization"] = f"Bearer {tok}"
+#             r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
 
-        # 토큰 만료 시 1회만 재시도
-        if r.status_code == 401:
-            _AI_JWT = None
-            _AI_JWT_EXP = 0
-            tok = _get_ai_token(camera_id)
-            headers["Authorization"] = f"Bearer {tok}"
-            r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
+#         # 상태별 로그
+#         if 200 <= r.status_code < 300:
+#             print(f"[AI→EVENT] ✅ {r.status_code} {payload.get('type')}")
+#         elif 400 <= r.status_code < 500:
+#             print(f"[AI→EVENT] ⚠️ Client {r.status_code}")
+#         else:
+#             print(f"[AI→EVENT] ⚠️ Server {r.status_code}")
 
-        # 상태별 로그
-        if 200 <= r.status_code < 300:
-            print(f"[AI→EVENT] ✅ {r.status_code} {payload.get('type')}")
-        elif 400 <= r.status_code < 500:
-            print(f"[AI→EVENT] ⚠️ Client {r.status_code}")
-        else:
-            print(f"[AI→EVENT] ⚠️ Server {r.status_code}")
+#     except Exception as e:
+#         print(f"[AI→EVENT] ❌ Exception: {e.__class__.__name__} {e}")
 
-    except Exception as e:
-        print(f"[AI→EVENT] ❌ Exception: {e.__class__.__name__} {e}")
 
 
 def _safe_int_pair(t):
@@ -134,11 +243,15 @@ def draw_seats(frame: np.ndarray, show_debug: bool = True) -> np.ndarray:
             d_near = float(s.get("d_near", 0)); d_far = float(s.get("d_far", 0))
             inward = 1 if int(s.get("inward_sign", 1)) >= 0 else -1
             seat_id = int(s.get("seat_id", 0))
+            ref_w = int(s.get("ref_w", w)); ref_h = int(s.get("ref_h", h))  # 참조 해상도
         else:
             p1 = list(getattr(s, "p1")); p2 = list(getattr(s, "p2"))
             d_near = float(getattr(s, "d_near")); d_far = float(getattr(s, "d_far"))
             inward = 1 if int(getattr(s, "inward_sign")) >= 0 else -1
             seat_id = int(getattr(s, "seat_id", 0))
+            # SeatWire 객체에서 참조 해상도 가져오기 (없으면 현재 프레임 해상도를 가정)
+            ref_w = int(getattr(s, "ref_w", w))
+            ref_h = int(getattr(s, "ref_h", h))
 
         # 1) 여기만 변경: 좌표 스케일 적용
         x1, y1 = float(p1[0]) * scale_x, float(p1[1]) * scale_y
@@ -273,13 +386,25 @@ def mjpeg_generator(
                 fail_cnt = 0
 
                 # 1) 추론 (블러/침입)
-                res = run_inference_on_image(
-                    frame,
-                    camera_id="cam2",
-                    do_blur=do_blur,
-                    do_intrusion=do_intrusion,
-                )
-                frame = res.frame
+                cam_id = f"cam{source}" if str(source).strip().isdigit() else str(source)
+                try:
+                    res = run_inference_on_image(
+                        frame,
+                        camera_id=cam_id,
+                        do_blur=do_blur,
+                        do_intrusion=do_intrusion,
+                    )
+                except Exception as e:
+                    print("[stream] run_inference_on_image() failed:", e)
+                    res = types.SimpleNamespace()
+                    res.frame = frame                      # ← 여기서 인스턴스에 대입
+                    res.intrusion_started = False
+                    res.intrusion_active = False
+                    res.seat_id = None
+                    res.meta = {"camera_id": cam_id}
+                    res.identity = None
+                    res.identity_conf = None
+                    res.phone_capture = None
 
                 # 2) ROI 오버레이
                 if roi_debug:
