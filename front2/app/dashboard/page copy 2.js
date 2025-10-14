@@ -62,24 +62,8 @@ useEffect(() => {
     socket.on("disconnect", () => console.log("socket disconnected"));
 
     // 서버가 실시간 이벤트를 푸시
-    // 표준 채널: 새 이벤트 공통
-    socket.on("events:new", (ev) => {
-      setEventLogs((prev = []) => [lineOf(ev), ...prev].slice(0, 200));
-      if (isIntrusion(ev)) showBannerFromEvent(ev);
-    });
-
-    // ✅ 타입별(선택): 침입만 따로 처리하고 싶을 때
-    socket.on("events:intrusion", (ev) => {
-      // 예: 강조 효과/사운드 등
-      if (isIntrusion(ev)) showBannerFromEvent(ev);
-    });
-
-    // 🧯 레거시 호환(서버가 아직 old 채널을 쏘는 경우 대비)
     socket.on("event", (ev) => {
-      setEventLogs((prev = []) => [lineOf(ev), ...prev].slice(0, 200));
-      if (isIntrusion(ev)) showBannerFromEvent(ev);
-    });
-    socket.on("intrusion", (ev) => {
+      setEventLogs((prev) => [lineOf(ev), ...prev].slice(0, 200));
       if (isIntrusion(ev)) showBannerFromEvent(ev);
     });
    
@@ -124,13 +108,35 @@ useEffect(() => {
 
 const lineOf = (ev) => {
   const typ = String(ev.type ?? ev.event_type ?? "event").toLowerCase();
+  // const seat = getSeat(ev);
+  // const cam  = getCam(ev);
   const seat = ev.seat_id ?? ev.meta?.seat_no ?? "-";
   const cam  = ev.camera_id ?? ev.meta?.device_id ?? "-";
 
+  //사람, 신뢰도
+  // const who  = getPerson(ev);
+  // const conf = getConf(ev);
   const who  = ev.person_id ?? ev.identity ?? ev.meta?.user_label ?? "Unknown";
   const conf = ev.confidence ?? ev.identity_conf ?? null;
+
+  // const when = getWhenSec(ev);
+
+  const whoTxt  = who ? ` · by ${who}` : "";
+  // const confTxt = conf != null ? ` (${Number(conf).toFixed(2)})` : "";
   const confTxt = conf != null ? ` (${Math.round(conf * 100) / 100})` : "";
 
+  // duration(초) 계산
+  // const started = toEpochSec(ev.started_at);
+  // const ended   = toEpochSec(ev.ended_at);
+  // const durTxt  = (started && ended && ended >= started)
+  //   ? ` · dur:${ended - started}s` : "";
+  
+  // if (typ === "intrusion") {
+  // const whoTxt = who !== "Unknown" ? ` by ${who}` : "";
+  // return `${fmt(when)} [Seat ${seat} · Cam ${cam}] Intrusion${whoTxt} (${conf ?? "-"}) · dur:${ev.duration_sec ?? "-"}s`;
+  // }
+
+  // 시간/지속시간
   const s = toEpochSec(ev.started_at);
   const e = toEpochSec(ev.ended_at);
   const when = e ?? toEpochSec(ev.at) ?? s ?? Math.floor(Date.now() / 1000);
@@ -143,12 +149,13 @@ const lineOf = (ev) => {
     return `${fmt(when)} [Seat ${seat} · Cam ${cam}] Intrusion by ${who}${confTxt}${durTxt}`;
   }
   if (typ === "intrusion_started") {
-    return `${fmt(when)} [Seat ${seat} · Cam ${cam}] Intrusion STARTED${confTxt}`;
+    return `${fmt(when)} [Seat ${seat} · Cam ${cam}] Intrusion STARTED`;
   }
-
   return `${fmt(when)} [${typ}] ${JSON.stringify(ev)}`;
-}
-
+};
+//   // 그 외 이벤트 공통 포맷(디버깅용 필드도 함께) -> 오류 떠서 삭제함
+//   return `${fmt(when)} [${typ}] seat=${seat} cam=${cam}${who ? ` person=${who}` : ""}`;
+// };
 
  const isIntrusion = (ev) => {
    const t = String(ev?.type ?? ev?.event_type ?? "").toLowerCase();
@@ -158,10 +165,13 @@ const lineOf = (ev) => {
 
 
   const showBannerFromEvent = (ev) => {
-    const seat = ev.seat_id ?? ev.zone_id ?? ev.meta?.seat_no ?? "-";
-    const who  = ev.person_id ?? ev.user_label ?? ev.identity ?? ev.meta?.user_label ?? "Unknown";
-    const atSec = toEpochSec(ev.ended_at) ?? toEpochSec(ev.at) ?? Math.floor(Date.now() / 1000);
+    const seat = ev.zone_id ?? ev.seat_id ?? "-";
+    const who = ev.user_label ?? ev.user ?? ev.identity ?? "Unknown";
+    const atSec =
+      toEpochSec(ev.ended_at) ?? toEpochSec(ev.at) ?? Math.floor(Date.now() / 1000);
+
     setBanner({ seatId: seat, who, at: atSec });
+
     if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
     bannerTimerRef.current = setTimeout(() => setBanner(null), INTRUSION_HOLD_MS);
   };
@@ -391,5 +401,4 @@ const lineOf = (ev) => {
       </section>
     </main>
   );
-} 
-
+}
