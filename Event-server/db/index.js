@@ -8,9 +8,35 @@ export const pool = new Pool({
   max: 10,
 });
 
-export async function query(text, params) {
-  const res = await pool.query(text, params);
-  return res;
+// 풀 에러 핸들해서 프로세스 크래시 방지
+pool.on("error", (err) => {
+  console.error("[PG POOL ERROR]", err?.code, err?.message);
+
+});
+
+// 공용 쿼리: 재시도 래퍼 (ECONNRESET, 57P01 등 일시 오류 대응)
+const RETRYABLE_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT",
+  "57P01", // admin_shutdown
+  "57P02", // crash_shutdown
+  "57P03", // cannot_connect_now
+]);
+
+export async function query(text, params, { retries = 3 } = {}) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await pool.query(text, params);
+    } catch (e) {
+      attempt++;
+      if (!RETRYABLE_CODES.has(e.code) || attempt > retries) {
+        throw e;
+      }
+      const backoff = Math.min(1000 * attempt, 3000);
+      console.warn(`[PG RETRY ${attempt}/${retries}]`, e.code, e.message);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
 }
 
 export async function assertOffeye() {

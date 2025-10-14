@@ -1,19 +1,22 @@
 // socket/socket.js
 import { Server } from "socket.io";
 
+let io = null;
+
 export function setupSocket(server) {
   const origins = (process.env.CORS_ORIGIN || "http://localhost:3000")
     .split(",")
     .map(s => s.trim())
     .filter(Boolean);
 
-  const io = new Server(server, {
+  io = new Server(server, {
     cors: {
-      origin: ["http://localhost:3000"],
+      origin: origins.length ? origins : ["http://localhost:3000"], // ← origins 사용
       credentials: true,
     },
+    path: "/socket.io",
     transports: ["polling", "websocket"],
-    upgrade: true,   // 필요하면 강제
+    upgrade: true,
   });
 
   io.on("connection", (socket) => {
@@ -24,13 +27,12 @@ export function setupSocket(server) {
     });
     socket.join("dashboard");
     socket.emit("connected", { sid: socket.id });
-    socket.on("disconnect", () => {});
   });
 
-  return {
-    io,
-    broadcastEvent: (payload) => io.emit("server-event", payload),
-    broadcastEvent: (payload) => io.to("dashboard").emit("event:new", payload),
-    broadcastLog: (payload) => io.to("dashboard").emit("log:new", payload),
-  };
+  return io; // ← 래퍼 객체 말고 io 인스턴스를 직접 리턴
+}
+
+export function getIO() {
+  if (!io) throw new Error("socket.io not initialized");
+  return io;
 }

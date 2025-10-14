@@ -198,23 +198,17 @@ export async function addEvent(req, res) {
     try {
       const io = req.app.get("io");
       if (io) {
-        // at 계산 보강: 숫자면 그대로(초 단위), 문자열/Date면 파싱
-        const atRaw =
+        const at =
           r.at ??
           r.created_at ??
           r.ended_at ??
           r.started_at ??
-          Date.now(); // atISO 미정의 방지
-
-        const atEpoch =
-          typeof atRaw === "number"
-            ? atRaw
-            : Math.floor(new Date(atRaw).getTime() / 1000);
+          atISO;
 
         const ev = {
           id: r.id,
-          type: String(r.type ?? r.event_type ?? "").toLowerCase(),
-          event_type: String(r.type ?? r.event_type ?? "").toLowerCase(),
+          type: (r.type ?? r.event_type ?? "").toLowerCase(),
+          event_type: (r.type ?? r.event_type ?? "").toLowerCase(),
           seat_id: r.seat_id ?? r.meta?.seat_no ?? null,
           camera_id: r.camera_id ?? r.meta?.device_id ?? null,
           person_id: r.person_id ?? null,
@@ -222,19 +216,15 @@ export async function addEvent(req, res) {
           duration_sec: r.duration_sec ?? null,
           started_at: r.started_at ?? null,
           ended_at: r.ended_at ?? null,
-          at: atEpoch,
-          meta:
-            typeof r.meta === "string" ? safeJson(r.meta) : (r.meta ?? {}),
+          at: Math.floor(new Date(at).getTime() / 1000),
+          meta: typeof r.meta === "string" ? safeJson(r.meta) : (r.meta ?? {}),
         };
-
-        // ✅ 채널명 통일 (대시보드 룸으로)
-        io.to("dashboard").emit("events:new", ev);
-        if (ev.type) io.to("dashboard").emit(`events:${ev.type}`, ev);
+        io.emit("event", ev);
+        if (ev.type) io.emit(ev.type, ev);
       }
     } catch (e) {
       console.warn("[addEvent] socket emit skipped:", e?.message);
     }
-
 
     // 최종 응답: 목록과 동일한 키로 반환
     return res.status(201).json({

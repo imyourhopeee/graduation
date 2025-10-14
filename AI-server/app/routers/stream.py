@@ -65,23 +65,6 @@ def _get_ai_token(camera_id: str = "cam2") -> str:
 
     return _AI_JWT
 
-    # # 토큰이 없거나 만료 임박(30초 이내)이면 재발급
-    # if (not _AI_JWT) or (now > (_AI_JWT_EXP - 30)):
-    #     payload = {
-    #         "sub": "ai",
-    #         "role": "ai",
-    #         "camera_id": camera_id,
-    #         "iat": now,
-    #         "exp": now + 60 * 30,  # 30분 유효 (주석은 10분이었는데 실제값과 맞춤)
-    #     }
-    #     tok = jwt.encode(payload, AI_JWT_SECRET, algorithm="HS256")
-    #     if isinstance(tok, bytes):  # PyJWT v1 대비
-    #         tok = tok.decode("utf-8")
-    #     _AI_JWT = tok
-    #     _AI_JWT_EXP = payload["exp"]
-
-    # return _AI_JWT
-
 def _post_event(payload: dict, camera_id: str = "cam0") -> None:
     base = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
     url = f"{base.rstrip('/')}/events"
@@ -99,6 +82,9 @@ def _post_event(payload: dict, camera_id: str = "cam0") -> None:
     body = dict(payload)
     body.setdefault("camera_id", camera_id)
     body.setdefault("at", now)
+
+    if "event_type" not in body and "type" in body:
+        body["event_type"] = str(body.pop("type")).lower()
 
     # 헤더 구성
     headers = {
@@ -120,37 +106,11 @@ def _post_event(payload: dict, camera_id: str = "cam0") -> None:
             r = SESSION.post(url, json=body, headers=alt_headers, timeout=5)
 
         if 200 <= r.status_code < 300:
-            print(f"[AI→EVENT] ✅ {r.status_code} {body.get('type')}")
+            print(f"[AI→EVENT] ✅ {r.status_code} {body.get('event_type')}")
         else:
             print(f"[AI→EVENT] ❌ {r.status_code} {r.text[:200]}")
     except Exception as e:
         print(f"[AI→EVENT] EXC {e.__class__.__name__}: {e}")
-
-# def _post_event(payload: dict, camera_id: str = "cam0") -> None:
-#     # .env 키를 너희 이벤트 서버 명세에 맞춤 (EVENT_SERVER_URL 사용)
-#     base = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
-#     url = f"{base.rstrip('/')}/events"
-
-#     # 토큰은 HS256, role=ai, camera_id 포함
-#     now = int(time.time())
-#     token = jwt.encode(
-#         {"role": "ai", "camera_id": camera_id, "iat": now, "exp": now + 300},
-#         AI_JWT_SECRET,
-#         algorithm="HS256",
-#     )
-#     if isinstance(token, bytes):
-#         token = token.decode("utf-8")
-
-#     body = dict(payload)
-#     body.setdefault("camera_id", camera_id)
-#     body.setdefault("at", now)
-
-#     # 여러 서버 구현을 모두 만족시키도록 인증을 넉넉하게 넣음
-#     headers = {
-#         "Authorization": f"Bearer {token}",
-#         "X-AI-Token": token,                 # 미들웨어가 이 헤더를 보는 경우 대비
-#         "Content-Type": "application/json",
-#     }
 
     try:
         r = SESSION.post(url, json=body, headers=headers, timeout=5)
@@ -166,47 +126,12 @@ def _post_event(payload: dict, camera_id: str = "cam0") -> None:
     except Exception as e:
         print(f"[AI→EVENT] EXC {e.__class__.__name__}: {e}")
 
-
-# def _post_event(payload: dict, camera_id: str = "cam2") -> None:
-#     global _AI_JWT, _AI_JWT_EXP
-#     try:
-#         tok = _get_ai_token(camera_id)
-#         headers = {"Authorization": f"Bearer {tok}"}
-#         body = dict(payload)
-#         body.setdefault("camera_id", camera_id)
-#         if "at" not in body and "timestamp" not in body:
-#             body["at"] = int(time.time())
-
-#         # 1차 요청
-#         r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
-
-#         # 토큰 만료 시 1회만 재시도
-#         if r.status_code == 401:
-#             _AI_JWT = None
-#             _AI_JWT_EXP = 0
-#             tok = _get_ai_token(camera_id)
-#             headers["Authorization"] = f"Bearer {tok}"
-#             r = SESSION.post(EVENT_URL, json=body, headers=headers, timeout=2.0)
-
-#         # 상태별 로그
-#         if 200 <= r.status_code < 300:
-#             print(f"[AI→EVENT] ✅ {r.status_code} {payload.get('type')}")
-#         elif 400 <= r.status_code < 500:
-#             print(f"[AI→EVENT] ⚠️ Client {r.status_code}")
-#         else:
-#             print(f"[AI→EVENT] ⚠️ Server {r.status_code}")
-
-#     except Exception as e:
-#         print(f"[AI→EVENT] ❌ Exception: {e.__class__.__name__} {e}")
-
-
-
 def _safe_int_pair(t):
     # ('12','34') 같은 문자열 좌표도 안전히 변환
     return (int(float(t[0])), int(float(t[1])))
 
 
-def draw_seats(frame: np.ndarray, show_debug: bool = True) -> np.ndarray:
+def draw_seats(frame: np.ndarray, show_debug: bool = True, style: str = "core") -> np.ndarray:
     h, w = frame.shape[:2]
     seats = _engine().get_seats() or []
 
@@ -281,7 +206,28 @@ def draw_seats(frame: np.ndarray, show_debug: bool = True) -> np.ndarray:
         poly = np.array([(int(x1), int(y1)), (int(x2), int(y2)), b2, a2], dtype=np.int32)
 
         cv2.polylines(frame, [poly], True, (0, 255, 255), 2, cv2.LINE_AA)
+        if style == "config":
+            # 추가: band 가이드를 config와 같은 룩으로 표시(b_near/b_far 보간)
+            # y1,y2에 대해 band 값을 보간해서 ±band만큼 평행이동한 "얇은 폴리라인"을 덧그립니다.
+            # (seat dict/객체에서 b_near,b_far 안전 추출)
+            b_near = float(s.get("b_near", 20.0)) if isinstance(s, dict) else float(getattr(s, "b_near", 20.0))
+            b_far  = float(s.get("b_far", 8.0))   if isinstance(s, dict) else float(getattr(s, "b_far", 8.0))
 
+            def band_at(y):
+                # stream.py 코어존 깊이 보간과 동일한 t 사용  # 参照: :contentReference[oaicite:10]{index=10}
+                t = (y - y_far) / (y_near - y_far) if abs(y_near - y_far) > 1e-6 else 0.0
+                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                return b_far * (1.0 - t) + b_near * t
+
+            # p1, p2에서의 band 계산
+            band1, band2 = band_at(y1), band_at(y2)
+
+            # 밴드 라인(코어 바깥쪽 또는 안쪽)에 얇은 폴리라인 추가(색/두께는 취향)
+            a_band = (int(x1 + nx * (d1 + band1)), int(y1 + ny * (d1 + band1)))
+            b_band = (int(x2 + nx * (d2 + band2)), int(y2 + ny * (d2 + band2)))
+            band_poly = np.array([(int(x1), int(y1)), (int(x2), int(y2)), b_band, a_band], dtype=np.int32)
+            cv2.polylines(frame, [band_poly], True, (0, 200, 255), 1, cv2.LINE_AA)  # 살짝 다른 톤
+            
         midx = int((x1 + x2) * 0.5 + nx * (d1 + 12))
         midy = int((y1 + y2) * 0.5 + ny * (d1 + 12))
         cv2.putText(frame, f"Seat {seat_id}", (midx, midy),
@@ -408,34 +354,10 @@ def mjpeg_generator(
 
                 # 2) ROI 오버레이
                 if roi_debug:
-                    frame = draw_seats(frame, show_debug=True)
+                    frame = draw_seats(frame, show_debug=True, style="config")
 
                 # 3) 이벤트 전송 (기존 로직 유지)
                 cid = (res.meta or {}).get("correlation_id")
-                if res.intrusion_started and cid and cid not in _SENT_STARTED:
-                    _post_event({
-                        "type": "intrusion_started",
-                        "correlation_id": cid,
-                        "seat_id": res.seat_id,
-                        "camera_id": (res.meta or {}).get("camera_id"),
-                        "identity": res.identity,
-                        "identity_conf": res.identity_conf,
-                        "phone_capture": res.phone_capture,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    })
-                    _SENT_STARTED.add(cid)
-
-                if res.intrusion_active and cid and (res.identity is not None) and (cid not in _SENT_IDENTITY):
-                    _post_event({
-                        "type": "intrusion_identity",
-                        "correlation_id": cid,
-                        "seat_id": res.seat_id,
-                        "camera_id": (res.meta or {}).get("camera_id"),
-                        "identity": res.identity,
-                        "identity_conf": res.identity_conf,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    })
-                    _SENT_IDENTITY.add(cid) #중복방지
 
                 if (not res.intrusion_active) and cid:
                     _SENT_STARTED.discard(cid)

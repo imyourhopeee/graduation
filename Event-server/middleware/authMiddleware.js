@@ -51,6 +51,7 @@ import jwt from "jsonwebtoken";
 //   }
 // }
 export function verifyAI(req, res, next) {
+  console.log("[verifyAI] headers:", req.headers);  // 🔍 추가 (AI 요청이 실제로 어떻게 오는지 보기)
 
    const h = req.headers.authorization || "";
    if (!h) {
@@ -79,10 +80,11 @@ export function verifyAI(req, res, next) {
      console.log("[verifyAI] ok sub=%s role=%s exp=%s now=%s",
        payload?.sub, payload?.role, payload?.exp, Math.floor(Date.now()/1000));
 
-     if (payload?.role !== "ai") {
-       console.log("[verifyAI] role not ai:", payload?.role);
-       return res.status(403).json({ message: "invalid ai token", reason: "role" });
-     }
+     if (!payload?.role || payload.role.toLowerCase() !== "ai") {
+      console.log("[verifyAI] role not ai:", payload?.role);
+      return res.status(403).json({ message: "invalid ai token", reason: "role" });
+    }
+
      req.ai = payload;
      return next();
    } catch (e) {

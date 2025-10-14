@@ -120,17 +120,6 @@ class EMA:
         return tuple(map(int, self.val))
 
 
-# =========================
-# 런타임용 TripwireApp (inference.py에서 사용)
-# class TripwireApp:
-#     def __init__(self, cam, seats, dwell_sec, on_intrusion):
-#         self.cam = 0 if str(cam).strip() == "0" else cam
-#         self.seats: List[SeatWire] = self._normalize_seats(seats)
-#         self.dwell_sec = float(dwell_sec)
-#         self.exit_sec = float(EXIT_SECONDS)
-#         self.on_intrusion = on_intrusion
-#         self.ema = EMA(alpha=float(os.getenv("EMA_ALPHA", "0.25")))
-#         self.person_model = self._load_person_model()
 class TripwireApp:
     def __init__(self, cam, seats, dwell_sec, on_intrusion):
         self.cam = 0 if str(cam).strip() == "0" else cam
@@ -180,7 +169,6 @@ class TripwireApp:
         intruded_seat_id = None
 
         try:
-            # 1) 바운딩박스 → 발 좌표
             feet_points = []
             for (x1, y1, x2, y2) in (person_bboxes or []):
                 fx = int((x1 + x2) / 2)
@@ -192,61 +180,64 @@ class TripwireApp:
                     self._ema = EMA(alpha=0.25)
                 feet_points = [self._ema.update(fp) for fp in feet_points]
 
-            # 2) 좌석별 FSM
+            # 좌석별 FSM
             for idx, s in enumerate(self.seats or []):
                 any_core = any(s.intruded(fp) for fp in feet_points)
                 prev = s.state
-
                 update_seat_fsm(s, any_core, dt,
                                 dwellSeconds=self.dwell_sec,
                                 exitSeconds=self.exit_sec)
 
-                # --- 침입 시작: INTRUDED 진입 순간 시작시각만 기록 ---
+                # === 침입 시작 ===
                 if prev != "INTRUDED" and s.state == "INTRUDED":
-                    seat = s.seat_id if s.seat_id is not None else idx
-                    self.active_intrusion[seat] = {"start": time.time(), "person": None, "conf": None}
                     started = True
-                    intruded_seat_id = seat
+                    intruded_seat_id = s.seat_id or idx
+                    # 내부 기록만 남김
+                    self.active_intrusion[intruded_seat_id] = {
+                        "start": time.time(),
+                        "person": None,
+                        "conf": None
+                    }
 
-                # --- 침입 중: active 플래그 유지 ---
+                # === 침입 중 ===
                 if s.state == "INTRUDED":
                     active = True
                     if intruded_seat_id is None:
-                        intruded_seat_id = s.seat_id if s.seat_id is not None else idx
+                        intruded_seat_id = s.seat_id or idx
 
-                # --- 침입 종료: OUTSIDE 전이 시 완결 이벤트 1회 콜백 ---
+                # === 침입 종료 ===
                 if prev == "INTRUDED" and s.state == "OUTSIDE":
-                    seat = s.seat_id if s.seat_id is not None else idx
+                    seat = s.seat_id or idx
                     info = self.active_intrusion.pop(seat, None)
                     if info:
-                        start_t = info.get("start", time.time())
-                        end_t   = time.time()
+                        start_t = info["start"]
+                        end_t = time.time()
                         duration = round(end_t - start_t, 1)
-                        person   = info.get("person") or "Unknown"
-                        conf     = info.get("conf")
 
                         if callable(self.on_intrusion):
                             try:
                                 self.on_intrusion(
                                     seat, end_t,
                                     {
-                                        "type": "intrusion",
+                                        "event_type": "intrusion",                     # ← 여기만 변경!
                                         "seat_id": seat,
                                         "camera_id": str(self.cam),
-                                        "person_id": person,
-                                        "confidence": conf,
                                         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_t)),
-                                        "ended_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_t)),
+                                        "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_t)),
                                         "duration_sec": duration,
-                                        "meta": {"seat_no": seat, "device_id": str(self.cam), "user_label": person},
+                                        "meta": {
+                                            "seat_no": seat,                           # DB에는 seat_id 컬럼이 없고 meta.seat_no 사용
+                                            "device_id": str(self.cam),               # meta.device_id 사용
+                                            "dwell_sec": self.dwell_sec
+                                        }
                                     }
                                 )
                             except Exception as e:
-                                print(f"[Tripwire] on_intrusion failed: {e}")
+                                print(f"[Tripwire.on_intrusion] failed: {e}")
         except Exception as e:
-            print(f"[Tripwire.update] EXC {e}")
+            print("[Tripwire.update] EXC", e)
 
-        # ✅ 어떤 경로로 와도 항상 튜플 반환
+        # 반환값 보장
         return started, active, intruded_seat_id
 
 

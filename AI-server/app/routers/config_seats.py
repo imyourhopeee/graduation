@@ -73,10 +73,39 @@ def put_seats(seats: List[SeatWireModel]):
     try:
         # 1) 파일에 그대로 저장(메타 포함)
         raw_list = [s.model_dump() for s in seats]
+
+        # === [INSERT] 정규화 변환: p1/p2가 픽셀 좌표(>1)이고 ref_w/h가 있으면 0~1로 변환 ===
+        for d in raw_list:
+            p1 = d.get("p1") or [0, 0]
+            p2 = d.get("p2") or [0, 0]
+            rw = d.get("ref_w")
+            rh = d.get("ref_h")
+
+            try:
+                x_max = max(float(p1[0]), float(p2[0]))
+                y_max = max(float(p1[1]), float(p2[1]))
+                normalized_already = (x_max <= 1.01 and y_max <= 1.01)
+            except Exception:
+                # 좌표가 비정상 형식이면 스킵 (기존 로직 유지)
+                normalized_already = True  # 변환 시도 안 함
+
+            # 픽셀 좌표인데 기준 해상도가 존재하면 정규화
+            if (not normalized_already) and rw and rh and float(rw) > 1 and float(rh) > 1:
+                d["p1"] = [float(p1[0]) / float(rw), float(p1[1]) / float(rh)]
+                d["p2"] = [float(p2[0]) / float(rw), float(p2[1]) / float(rh)]
+                # 선택: 정규화 여부 힌트(나중에 디버깅용)
+                d["coord_norm"] = True
+            else:
+                # 이미 정규화여도 힌트만 남김(옵션)
+                if normalized_already:
+                    d["coord_norm"] = True
+                # 픽셀인데 ref_w/h가 없으면 그대로 저장(기존 동작 유지)
+                # d["coord_norm"] = False  # 필요하면 켜기
+
         with open(SEATS_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(raw_list, f, ensure_ascii=False, indent=2)
 
-        # 2) ★ 엔진 메모리에 허용 키만 반영
+        # 2) ★ 엔진 메모리에 허용 키만 반영 (기존 로직 그대로)
         try:
             clean = [to_engine_dict(s) for s in raw_list]
             new_seats = [SeatWire(**c) for c in clean]
@@ -88,6 +117,7 @@ def put_seats(seats: List[SeatWireModel]):
         return {"ok": True, "count": len(seats), "path": SEATS_JSON_PATH}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # Dwell 시간 설정 추가

@@ -2,26 +2,40 @@
 import { pool } from "../db/index.js";
 
 // ──────────────────────────────────────────────────────────────
-// 현재 events 테이블 컬럼(스크린샷 기준):
+// events 테이블 컬럼(현재 스키마):
 // id, started_at, ended_at, duration_sec, meta(JSONB), created_at,
 // event_type, person_id, confidence
 // ──────────────────────────────────────────────────────────────
 
-// ✅ DB에 들어갈 행으로 컨트롤러 payload를 정규화 (핵심)
+// 숫자/문자/Date를 TIMESTAMPTZ ISO로 정규화
+function toIsoOrNull(v) {
+  if (v == null || v === "") return null;
+  if (v instanceof Date) return v.toISOString();
+  const n = Number(v);
+  if (Number.isFinite(n)) {
+    // 초 단위/밀리초 단위 추정
+    const ms = n > 1e12 ? n : n * 1000;
+    return new Date(ms).toISOString();
+  }
+  const ms = Date.parse(String(v));
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+// ✅ 컨트롤러 payload → DB 행 매핑 (스키마에 맞춤)
 function mapPayloadToRow(evt = {}) {
-  // controller.normalizeEventBody() 기준 매핑
-  const event_type =
+  const rawType =
     typeof evt.event_type === "string"
       ? evt.event_type
       : typeof evt.type === "string"
       ? evt.type
       : undefined;
 
-  // meta JSONB 구성
-  const seat_no =
-    evt.seat_id ?? evt?.meta?.seat_no ?? null;
-  const device_id =
-    evt.camera_id ?? evt?.meta?.device_id ?? null;
+  // event_type은 소문자로 통일 저장
+  const event_type = rawType ? String(rawType).toLowerCase() : undefined;
+
+  // meta JSONB 구성 (seat_no/device_id를 meta로 수렴)
+  const seat_no = evt.seat_id ?? evt?.meta?.seat_no ?? null;
+  const device_id = evt.camera_id ?? evt?.meta?.device_id ?? null;
 
   const meta = {
     ...(evt.meta || {}),
@@ -29,20 +43,19 @@ function mapPayloadToRow(evt = {}) {
     ...(device_id != null ? { device_id: String(device_id) } : {}),
   };
 
-  const row = {
+  return {
     event_type,                                  // TEXT
-    started_at: evt.started_at ?? null,          // TIMESTAMPTZ
-    ended_at: evt.ended_at ?? null,              // TIMESTAMPTZ
-    duration_sec: evt.duration_sec ?? null,      // INT
-    person_id: evt.person_id ?? null,            // TEXT
-    confidence: evt.confidence ?? null,          // FLOAT
+    started_at: toIsoOrNull(evt.started_at),     // TIMESTAMPTZ
+    ended_at: toIsoOrNull(evt.ended_at),         // TIMESTAMPTZ
+    duration_sec:
+      evt.duration_sec == null ? null : Number(evt.duration_sec), // INT
+    person_id:
+      evt.person_id == null ? null : String(evt.person_id),       // TEXT
+    confidence:
+      evt.confidence == null ? null : Number(evt.confidence),     // FLOAT
     meta,                                        // JSONB
     // created_at: DB default NOW()
   };
-
-  // controller에서 at만 있고 started/ended 없을 때 ended_at 채우는 로직이 있으므로
-  // 여긴 그대로 둡니다(컨트롤러에서 이미 보정했다는 가정).
-  return row;
 }
 
 // 실제 DB에 존재하는 컬럼만 명시
@@ -54,10 +67,9 @@ const EVENT_COLUMNS = [
   "person_id",
   "confidence",
   "meta",
-  // created_at 은 DB DEFAULT NOW()면 생략
 ];
 
-/** 안전한 INSERT: DB 컬럼 화이트리스트만 사용 */
+/** 안전 INSERT: 허용된 컬럼만 저장 */
 export async function saveEvent(row, client = pool) {
   const cols = [];
   const vals = [];
@@ -81,19 +93,22 @@ export async function saveEvent(row, client = pool) {
   return rows[0].id;
 }
 
-/** 컨트롤러에서 사용하는 단건 INSERT */
-export async function insertEvent(evt) {
-  const row = mapPayloadToRow(evt);     // ✅ 컨트롤러 payload → DB행
-  return saveEvent(row);
+/** 컨트롤러에서 사용하는 단건 INSERT (트랜잭션용 client 전달 가능) */
+export async function insertEvent(evt, client = pool) {
+  const row = mapPayloadToRow(evt);
+  return saveEvent(row, client);
 }
 
+/** 대량 저장 (하나의 트랜잭션/커넥션으로 처리) */
 export async function saveEventsBulk(events) {
   if (!events?.length) return [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const ids = [];
-    for (const e of events) ids.push(await insertEvent(e)); // ✅ mapPayloadToRow 경유
+    for (const e of events) {
+      ids.push(await insertEvent(e, client)); // ✅ 같은 client 사용
+    }
     await client.query("COMMIT");
     return ids;
   } catch (err) {
@@ -104,53 +119,58 @@ export async function saveEventsBulk(events) {
   }
 }
 
-/** id로 조회 (컨트롤러가 원하는 형태로 가공해서 반환) */
+/** id로 조회: 프론트/소켓이 기대하는 키로 별칭 일치 */
 export async function selectEventById(id) {
-  const q = `
-    SELECT id, event_type, started_at, ended_at, duration_sec,
-           person_id, confidence, meta, created_at
-      FROM events
-     WHERE id = $1
-  `;
-  const { rows } = await pool.query(q, [id]);
-  const r = rows[0];
-  if (!r) return null;
-
-  // 컨트롤러가 기대하는 필드로 재가공
-  const type = r.event_type;
-  const seat_id =
-    r.meta && r.meta.seat_no != null ? Number(r.meta.seat_no) : null;
-  const camera_id =
-    r.meta && r.meta.device_id != null ? String(r.meta.device_id) : null;
-
-  return {
-    id: r.id,
-    type,
-    seat_id,
-    camera_id,
-    meta: r.meta || {},
-    started_at: r.started_at,
-    ended_at: r.ended_at,
-    duration_sec: r.duration_sec,
-    person_id: r.person_id,
-    confidence: r.confidence,
-    created_at: r.created_at,
-  };
+  const { rows } = await pool.query(
+    `
+    SELECT
+      id,
+      event_type AS type,
+      meta->>'seat_no'   AS seat_id,
+      meta->>'device_id' AS camera_id,
+      person_id,
+      confidence,
+      duration_sec,
+      started_at,
+      ended_at,
+      created_at AS at,
+      meta
+    FROM events
+    WHERE id = $1
+    `,
+    [id]
+  );
+  return rows[0] || null;
 }
 
-/** 최근 침입 조회 (프론트 대시보드용) */
-export async function selectRecentIntrusions(sinceISO) {
+/** 최근 침입 조회 (created_at 기준, 대소문자 무시) */
+export async function selectRecentIntrusions(sinceISO, limit = 200) {
   const { rows } = await pool.query(
-    `SELECT e.id, e.event_type, e.started_at, e.ended_at, e.duration_sec,
-            e.person_id, e.confidence, e.meta,
-            s.seat_no, s.owner_user_id, s.name AS seat_name
-       FROM events e
-       LEFT JOIN seats s
-         ON s.seat_no = (e.meta->>'seat_no')::int
-      WHERE e.event_type = 'intrusion'
-        AND e.started_at >= $1
-      ORDER BY e.started_at DESC`,
-    [sinceISO]
+    `
+    SELECT
+      e.id,
+      e.event_type AS type,
+      e.meta->>'seat_no'   AS seat_id,
+      e.meta->>'device_id' AS camera_id,
+      e.person_id,
+      e.confidence,
+      e.duration_sec,
+      e.started_at,
+      e.ended_at,
+      e.created_at AS at,
+      e.meta,
+      s.seat_no,
+      s.owner_user_id,
+      s.name AS seat_name
+    FROM events e
+    LEFT JOIN seats s
+      ON s.seat_no = (e.meta->>'seat_no')::int
+    WHERE LOWER(e.event_type) IN ('intrusion','intrusion_started','intrusion_triggered')
+      AND e.created_at >= $1
+    ORDER BY e.id DESC
+    LIMIT $2
+    `,
+    [sinceISO, Math.min(limit, 200)]
   );
   return rows;
 }

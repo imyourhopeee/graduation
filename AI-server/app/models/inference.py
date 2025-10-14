@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, time, uuid, threading, json, cv2, httpx
 import numpy as np
+import jwt
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
@@ -26,7 +27,7 @@ def _load_phone_detector():
 
 # ---- (2) 상수 ----
 EXIT_SECONDS  = float(os.getenv("EXIT_SECONDS", "1.5"))
-DWELL_SECONDS = 8.0
+DWELL_SECONDS = 10.0
 SEATS_JSON_PATH = os.getenv("SEATS_CONFIG", "tripwire_perp.json")
 DWELL_JSON_PATH = os.getenv("DWELL_CONFIG", "dwell.json")
 EVENT_BASE = os.getenv("EVENT_SERVER_URL", "http://localhost:3002")
@@ -86,6 +87,9 @@ class InferenceEngine:
         self._last_ts = time.time()
         self._corr_id = None
         self._last_identity = None
+
+        # 추가 - 얼굴+폰 스레드 실행 회차 카운터
+        self._run_seq = 0
 
     def _load_from_files(self) -> TripwireApp:
     # 좌석 정보 로드 (NULL/옛 키 정리)
@@ -157,10 +161,7 @@ class InferenceEngine:
             except Exception as e:
                 print("[LOAD DWELL FAIL]", e)
 
-        return TripwireApp(cam=None, seats=seats, dwell_sec=dwell_sec, on_intrusion=self._post_intrusion_event)
-
-
-
+        return TripwireApp(cam=os.getenv("CAMERA_ID", "cam0"), seats=seats, dwell_sec=dwell_sec, on_intrusion=self._post_intrusion_event)
 
     # --- API용 getter/setter ---
     def get_seats(self): return self.tripwire_app.seats
@@ -183,50 +184,32 @@ class InferenceEngine:
                 dets.append(Detection(bbox=(x1, y1, x2, y2), cls=0, score=float(b.conf)))
         return dets
 
-    # --- 얼굴 + 폰 스캔 백그라운드 ---
-    # def _kick_phone_thread(self, corr_id, seat_id):
-    #     if self._phone_busy:
-    #         return
-    #     self._phone_busy = True
-
-    #     def _run():
-    #         try:
-    #             face_timeout = float(os.getenv("FACE_TIMEOUT", "3.0"))
-    #             cam1 = os.getenv("CAM1_SOURCE", "1")
-    #             label, conf = recognize_identity(timeout_sec=face_timeout, cam_source=cam1)
-    #             with self._lock:
-    #                 self._last_identity = (label, conf) if label else None
-
-    #             phone_timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "2.0"))
-    #             ok = self.phone.scan(timeout_sec=phone_timeout)
-    #             with self._lock:
-    #                 self._last_phone_capture = bool(ok)
-    #         except Exception as e:
-    #             print("[PHONE THREAD ERR]", e)
-    #         finally:
-    #             with self._lock:
-    #                 self._phone_busy = False
-
-    #     threading.Thread(target=_run, daemon=True).start()
     def _kick_phone_thread(self, corr_id: str, seat_id: int | None):
         if self._phone_busy:
+            # 추가 - 스레드 실행중 로그 
+            print("[FACE] ⏩ ing (busy 스레드 실행중)")   
             return
         self._phone_busy = True
+        self._run_seq += 1 # 추가 - 스레드 회차 증가
+        print(f"[FACE] 🚀 start run={self._run_seq}") # 추가 - 스레드 시작 로그
 
-        def _run():
-            try:
-                # 1) 얼굴 인식
-                face_timeout = float(os.getenv("FACE_TIMEOUT", "3.0"))
+        def _run(): 
+            try: # 얼굴 + 휴대폰 검사 
+                # 1) 얼굴 인식 - 웹캠 10초간
+                face_timeout = float(os.getenv("FACE_TIMEOUT", "10.0"))
                 cam1 = os.getenv("CAM1_SOURCE", "1")
 
                 label = conf = None
-                try:
+
+                try: # 함수 호출부
                     face_res = recognize_identity(timeout_sec=face_timeout, cam_source=cam1)
                     if isinstance(face_res, tuple) and len(face_res) >= 2:
-                        label, conf = face_res[0], face_res[1]
-                    elif isinstance(face_res, str):
+                        #반환값은 튜플 형태이므로 정상적으로 이렇게 들어옴
+                        label, conf = face_res[0], face_res[1] 
+                    elif isinstance(face_res, str): #문자열로 들어왔을 경우 라벨 판정
                         label = face_res
                     # else: None 또는 형식 불일치 -> 그대로 None 유지
+
                 except Exception as fe:
                     print("[FACE RECOG ERR]", fe)
 
@@ -234,7 +217,7 @@ class InferenceEngine:
                     self._last_identity = (label, conf) if label else None
 
                 # 2) 휴대폰 후면 감지(옵션)
-                timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "3.0"))
+                timeout = float(os.getenv("PHONE_SCAN_TIMEOUT", "10.0"))
                 ok = False
                 try:
                     ok = bool(self.phone.scan(timeout_sec=timeout))  # False/True/None 방어
@@ -248,53 +231,96 @@ class InferenceEngine:
             finally:
                 with self._lock:
                     self._phone_busy = False
+                    # 추가 - 스레드 종료 로그
+                    print(f"[FACE] ✅ end   run={self._run_seq}")
+
 
         threading.Thread(target=_run, daemon=True).start()
 
 
     # --- 이벤트 전송 ---
-    def _post_intrusion_event(self, seat_id, timestamp, snapshot):
+    def _post_intrusion_event(self, seat_id, timestamp, event_data=None):
+        """
+        TripwireApp.update()에서 완결 이벤트(payload dict)를 전달하면 그대로 전송한다.
+        event_data가 없을 경우 기존 방식(내부 계산)으로 fallback.
+        """
         try:
-            with self._lock:
-                ident = self._last_identity
-            user_label = ident[0] if ident else None
-            user_conf  = ident[1] if ident else None
+            # case ① TripwireApp.update()에서 완성된 dict가 온 경우
+            if isinstance(event_data, dict):
+                payload = dict(event_data)
+                with self._lock:
+                    ident = self._last_identity
+                if ident:
+                    label, conf = ident
+                    payload["person_id"] = label
+                    payload["confidence"] = conf
+                    meta = dict(payload.get("meta") or {})
+                    meta["user_label"] = label
+                    payload["meta"] = meta
 
-            end_ts = timestamp or time.time()
-            start_ts = end_ts - self.tripwire_app.dwell_sec
+            else:
+                # case ② 예전처럼 내부에서 조립 (fallback)
+                with self._lock:
+                    ident = self._last_identity
+                user_label = ident[0] if ident else None
+                user_conf  = ident[1] if ident else None
 
-            # ISO8601로 맞춤 (이벤트 서버의 duration 계산과 대시보드 표시가 정확해짐)
-            started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
-            ended_iso   = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts))
+                end_ts = timestamp or time.time()
+                start_ts = end_ts - self.tripwire_app.dwell_sec
+                started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
+                ended_iso   = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts))
 
-            payload = {
-                "type": "intrusion",
-                "seat_id": int(seat_id) if seat_id is not None else None,  # ← 표준 키
-                "camera_id": os.getenv("CAMERA_ID", "cam0"),                # ← 표준 키
-                "person_id": user_label,                                    # ← 표준 키
-                "confidence": user_conf,
-                "started_at": started_iso,
-                "ended_at": ended_iso,
-                "duration_sec": round(end_ts - start_ts, 1),
-                "meta": {
-                    "seat_no": int(seat_id) if seat_id is not None else None,
-                    "device_id": os.getenv("CAMERA_ID", "cam0"),
-                    "user_label": user_label,
-                    "dwell_sec": self.tripwire_app.dwell_sec,
-                },
+                payload = {
+                    "event_type": "intrusion",
+                    "seat_id": int(seat_id) if seat_id is not None else None,
+                    "camera_id": os.getenv("CAMERA_ID", "cam0"),
+                    "person_id": user_label,
+                    "confidence": user_conf,
+                    "started_at": started_iso,
+                    "ended_at": ended_iso,
+                    "duration_sec": int(round(end_ts - start_ts)),
+                    "meta": {
+                        "seat_no": int(seat_id) if seat_id is not None else None,
+                        "device_id": os.getenv("CAMERA_ID", "cam0"),
+                        "user_label": user_label,
+                        "dwell_sec": self.tripwire_app.dwell_sec,
+                    },
+                }
+                
+        # --- 전송 ---
+            url = f"{EVENT_BASE.rstrip('/')}/{EVENT_PATH.lstrip('/')}"
+            ai_secret = os.getenv("AI_JWT_SECRET", "changeme")      # ✅ 이벤트서버 .env의 AI_JWT_SECRET과 동일해야 함
+            camera_id = os.getenv("CAMERA_ID", "cam0")
+
+            now = int(time.time())
+            token_payload = {
+                "sub": "ai",
+                "role": "ai",            # 이벤트서버 verifyAI가 요구: 소문자 'ai'
+                "camera_id": camera_id,
+                "iat": now,
+                "exp": now + 300,        # 5분
             }
 
-            url = f"{EVENT_BASE.rstrip('/')}/{EVENT_PATH.lstrip('/')}"
-            ai_key = os.getenv("AI_SHARED_KEY")
-            headers = {"X-AI-Key": ai_key} if ai_key else {}
+            jwt_token = jwt.encode(token_payload, ai_secret, algorithm="HS256")
+            if isinstance(jwt_token, bytes):
+                jwt_token = jwt_token.decode("utf-8")
+
+            headers = {
+                "Authorization": f"Bearer {jwt_token}",             # ✅ 핵심
+                "Content-Type": "application/json",
+                # "X-AI-Token": jwt_token,  # (선택) 미들웨어가 읽는다면 보조로
+            }
+
             with httpx.Client(timeout=5.0, headers=headers) as c:
                 r = c.post(url, json=payload)
             r.raise_for_status()
+            print(f"[EVENT] intrusion logged seat={seat_id} dur={payload.get('duration_sec')}s")
+                
         except Exception as e:
             print("[EVENT POST FAIL]", e)
 
 
-    # --- 메인 추론 ---
+    # --- 메인 추론부 ---
     def process_frame(self, frame: np.ndarray, camera_id="cam2", do_blur=True, do_intrusion=True) -> InferenceResult:
         now = time.time()
         dt = min(0.2, max(0.0, now - self._last_ts))
