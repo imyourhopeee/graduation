@@ -9,33 +9,51 @@ export default function MyPage() {
   const [user, setUser] = useState(null);
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE; 
 
-  useEffect(() => {
-    const token = localStorage.getItem("access_token") || sessionStorage.getItem("token");
-    if (!token) {
-      router.replace("/login");
-      return;
-    }
+useEffect(() => {
+  // 1) API_BASE 안전하게 만들기
+  const API_BASE =
+    process.env.NEXT_PUBLIC_API_BASE ||
+    process.env.NEXT_PUBLIC_EVENT_URL ||
+    "http://localhost:3002";
+  const base = API_BASE.replace(/\/+$/, "");
 
-    const load = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/auth/me`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!res.ok) throw new Error("me failed");
-        const me = await res.json();
-        // 화면 표시는 권한을 무조건 '관리자'로 고정
-        setUser({
-          name: me.name || "사용자",
-          email: me.email,
-          role: "관리자",
-          profileImg: "/user.png",
-        });
-      } catch {
-        router.replace("/login");
-      }
-    };
-    load();
-  }, [API_BASE, router]);
+  // 2) 토큰은 로그인 때 저장한 'access_token'만 사용 (헤더 방식 고정)
+  const token = localStorage.getItem("access_token") || sessionStorage.getItem("access_token");
+  if (!token) {
+    console.warn("[mypage] no access_token in storage");
+    router.replace("/login");
+    return;
+  }
+
+  // 3) /auth/me 경로 호출 (만약 서버에서 /api로 묶었으면 '/api/auth/me'로 바꾸세요!)
+  const meUrl = `${base}/auth/me`;
+
+  (async () => {
+    try {
+      const res = await fetch(meUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      // 디버깅 로그 (필요 없으면 나중에 지워도 됨)
+      console.debug("[mypage] GET", meUrl, "→", res.status);
+
+      if (!res.ok) throw new Error(`me failed: ${res.status}`);
+      const me = await res.json();
+
+      setUser({
+        name: me?.name || "사용자",
+        email: me?.email || "",
+        role: "관리자",
+        profileImg: "/user.png",
+      });
+    } catch (e) {
+      console.warn("[mypage] /auth/me 실패:", e?.message);
+      router.replace("/login");
+    }
+  })();
+}, [router]);
+
+
 
   if (!user) {
     return (

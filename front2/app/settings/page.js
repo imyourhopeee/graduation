@@ -57,6 +57,7 @@ export default function SettingPage() {
               onChange={(e) => setDetectionTime(e.target.value)}
               className="border px-4 py-2 rounded-lg text-gray-800"
             >
+              <option value="5">5초</option>
               <option value="10">10초</option>
               <option value="20">20초</option>
               <option value="30">30초</option>
