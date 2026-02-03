@@ -73,6 +73,7 @@ CCTV 영상에서 개인의 모니터·휴대폰·노트북이 블러 처리되�
  
 
  3.설정(침입으로 간주할 시간을 관리자가 설정 가능)
+ 
  <img width="623" height="237" alt="image" src="https://github.com/user-attachments/assets/dd840d10-2312-49ab-8722-539538102f1c" />
 
  4. 전체 로그
