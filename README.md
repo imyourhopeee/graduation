@@ -64,8 +64,11 @@ CCTV 영상에서 개인의 모니터·휴대폰·노트북이 블러 처리되�
  <img width="644" height="503" alt="image" src="https://github.com/user-attachments/assets/aa91a9c3-78ef-49fb-95c0-981268eeac2c" />
 
  - (로그) 주인이 아닌 'yoojin' 팀원이 침입한 경우
+
    <img width="614" height="36" alt="image" src="https://github.com/user-attachments/assets/b555fa15-1cb9-4c0d-bd49-afe75eaeff21" />
+   
  - (알림 배너)주인이 아닌 외부인이 침입한 경우
+
    <img width="696" height="36" alt="image" src="https://github.com/user-attachments/assets/cd9a49e7-eb7b-4368-987c-2414b52c552b" />
  
 
