@@ -6,7 +6,7 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 // import cookieParser from "cookie-parser";
-import { assertOffeye } from './db/index.js'; 
+import { assertOffeye } from "./db/index.js";
 import { query } from "./db/index.js";
 
 import { setupSocket } from "./socket/socket.js";
@@ -47,17 +47,25 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("[UNCAUGHT EXCEPTION]", err);
-})
-// 여기까지 추가 
-(async () => {
-  try {
-    const r = await pool.query("select current_database() db, current_schema() sch, now() now");
-    console.log("[DB] url=", process.env.DB_URL);
-    console.log("[DB] connect ok db=%s schema=%s now=%s", r.rows[0].db, r.rows[0].sch, r.rows[0].now);
-  } catch (e) {
-    console.error("[DB] connect fail", e);
-  }
-})();
+})(
+  // 여기까지 추가
+  async () => {
+    try {
+      const r = await pool.query(
+        "select current_database() db, current_schema() sch, now() now",
+      );
+      console.log("[DB] url=", process.env.DB_URL);
+      console.log(
+        "[DB] connect ok db=%s schema=%s now=%s",
+        r.rows[0].db,
+        r.rows[0].sch,
+        r.rows[0].now,
+      );
+    } catch (e) {
+      console.error("[DB] connect fail", e);
+    }
+  },
+)();
 
 // app.js 맨 위쪽 미들웨어들 전에 추가함!
 app.use((req, res, next) => {
@@ -65,28 +73,26 @@ app.use((req, res, next) => {
   next();
 });
 
-// app.use(cookieParser()); //추가함 
+// app.use(cookieParser()); //추가함
 // CORS
-const origins = (process.env.CORS_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
+const origins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
   .filter(Boolean);
 
-//<지선 추가함. 지워도ㅇㅋㅇㅋ
-  app.use(
+app.use(
   cors({
     origin: origins.length ? origins : ["http://localhost:3000"],
-    methods: ["GET","POST","PUT","DELETE","OPTIONS"], //추가
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], //추가
     allowedHeaders: ["Content-Type", "Authorization"], //추가
     credentials: true,
-  })
+  }),
 );
-//>
 
 app.use(express.json({ limit: "5mb" }));
 
 app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store');
+  res.set("Cache-Control", "no-store");
   next();
 });
 
@@ -113,9 +119,10 @@ app.use((err, req, res, next) => {
   console.error("[ERROR]", err);
   res
     .status(err.status || 500)
-    .json({ message: err.message || "Internal Error: 서버에 오류가 발생했습니다." });
+    .json({
+      message: err.message || "Internal Error: 서버에 오류가 발생했습니다.",
+    });
 });
-
 
 // socket
 
@@ -129,10 +136,15 @@ app.set("socket", socketApi);
       console.log(`[event-server] listening on http://localhost:${PORT}`);
     });
   } catch (e) {
-    console.error('[BOOT] failed to assert DB', e);
+    console.error("[BOOT] failed to assert DB", e);
     process.exit(1);
   }
 })();
 
-console.log("[boot] PORT=", process.env.PORT, "AI_JWT_SECRET length=", (process.env.AI_JWT_SECRET||"").length);
+console.log(
+  "[boot] PORT=",
+  process.env.PORT,
+  "AI_JWT_SECRET length=",
+  (process.env.AI_JWT_SECRET || "").length,
+);
 console.log("[boot] cwd=", process.cwd());
