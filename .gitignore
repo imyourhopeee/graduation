@@ -1,0 +1,9 @@
+Event-server/node_modules/
+Event-server/.env
+Event-server/package-lock.json
+Event-server/package.json
+Event-server/generate-ai-token.js
+AI-server/.env
+AI-server/tripwire_prep.json
+AI-server/dwell.json
+AI-server/runs/detect/
